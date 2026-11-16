@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "name": "course/dossier-writer",
+  "description": "Session 8: writes one dossier from the spec agent's and the QA agent's reports, with a risk rating and a recommended route.",
+  "unpack_inputs": true,
+  "models": ["qwen3.5-9b-mlx"],
+  "effort": "none",
+  "tools": [],
+  "max_retries": 0
+}

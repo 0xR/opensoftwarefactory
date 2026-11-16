@@ -1,0 +1,463 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+)
+
+var runIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+var traceIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var spanIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{16}$`)
+var stepPattern = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,255}$`)
+
+type observabilityClient struct {
+	base, user, password                         string
+	collectorBase, tracingHealth, tracingMetrics string
+	retentionDays                                int
+	http                                         *http.Client
+}
+
+type observabilityLog struct {
+	Timestamp any    `json:"timestamp,omitempty"`
+	Level     string `json:"level,omitempty"`
+	Message   string `json:"message,omitempty"`
+	Container string `json:"container,omitempty"`
+	Pod       string `json:"pod,omitempty"`
+	RunID     string `json:"run_id,omitempty"`
+	Step      string `json:"step,omitempty"`
+	Agent     string `json:"agent,omitempty"`
+	Attempt   any    `json:"attempt,omitempty"`
+	TraceID   string `json:"trace_id,omitempty"`
+	SpanID    string `json:"span_id,omitempty"`
+	Status    any    `json:"status,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+type observabilitySpan struct {
+	SpanID       string `json:"span_id"`
+	ParentSpanID string `json:"parent_span_id,omitempty"`
+	Operation    string `json:"operation,omitempty"`
+	Service      string `json:"service,omitempty"`
+	Status       string `json:"status,omitempty"`
+	Start        any    `json:"start,omitempty"`
+	End          any    `json:"end,omitempty"`
+	Duration     any    `json:"duration,omitempty"`
+}
+
+type observabilitySearch struct {
+	Hits    []map[string]any `json:"hits"`
+	Total   int              `json:"total"`
+	Partial bool             `json:"is_partial"`
+	Error   string           `json:"function_error"`
+}
+
+func loadObservability(base, configPath, collectorBase, tracingHealth, tracingMetrics string) *observabilityClient {
+	client := &observabilityClient{
+		base: strings.TrimRight(base, "/"), collectorBase: strings.TrimRight(collectorBase, "/"),
+		tracingHealth: strings.TrimRight(tracingHealth, "/"), tracingMetrics: strings.TrimRight(tracingMetrics, "/"),
+		http: &http.Client{Timeout: 15 * time.Second},
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return client
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || strings.HasPrefix(key, "#") {
+			continue
+		}
+		switch key {
+		case "ZO_ROOT_USER_EMAIL":
+			client.user = value
+		case "ZO_ROOT_USER_PASSWORD":
+			client.password = value
+		case "ZO_COMPACT_DATA_RETENTION_DAYS":
+			_, _ = fmt.Sscan(value, &client.retentionDays)
+		}
+	}
+	return client
+}
+
+func (o *observabilityClient) configured() bool {
+	return o != nil && o.base != "" && o.user != "" && o.password != ""
+}
+
+func (o *observabilityClient) search(ctx context.Context, sql string, start, end time.Time, size int) (observabilitySearch, error) {
+	return o.searchType(ctx, sql, start, end, size, "")
+}
+
+func (o *observabilityClient) searchType(ctx context.Context, sql string, start, end time.Time, size int, signal string) (observabilitySearch, error) {
+	if !o.configured() {
+		return observabilitySearch{}, errors.New("log search is not configured")
+	}
+	body, _ := json.Marshal(map[string]any{"query": map[string]any{
+		"sql": sql, "start_time": start.UnixMicro(), "end_time": end.UnixMicro(), "from": 0, "size": size,
+	}, "search_type": "ui", "timeout": 12})
+	endpoint := o.base + "/api/default/_search"
+	if signal != "" {
+		endpoint += "?type=" + url.QueryEscape(signal)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return observabilitySearch{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(o.user, o.password)
+	resp, err := o.http.Do(req)
+	if err != nil {
+		return observabilitySearch{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		return observabilitySearch{}, fmt.Errorf("log search returned %s", resp.Status)
+	}
+	var result observabilitySearch
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&result); err != nil {
+		return observabilitySearch{}, fmt.Errorf("decoding log search: %w", err)
+	}
+	if result.Error != "" {
+		return observabilitySearch{}, errors.New("log search was incomplete")
+	}
+	return result, nil
+}
+
+func stringField(row map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := row[key].(string); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+func nestedString(row map[string]any, parent, key string) string {
+	if nested, ok := row[parent].(map[string]any); ok {
+		return stringField(nested, key)
+	}
+	return ""
+}
+
+func normalizeLog(row map[string]any) observabilityLog {
+	return observabilityLog{
+		Timestamp: row["_timestamp"], Level: stringField(row, "level"), Message: stringField(row, "msg", "message", "log"),
+		Container: firstNonempty(nestedString(row, "kubernetes", "container_name"), stringField(row, "kubernetes_container_name")),
+		Pod:       firstNonempty(nestedString(row, "kubernetes", "pod_name"), stringField(row, "kubernetes_pod_name")),
+		RunID:     stringField(row, "run_id"), Step: stringField(row, "step"), Agent: stringField(row, "agent"), Attempt: row["attempt"],
+		TraceID: stringField(row, "trace_id"), SpanID: stringField(row, "span_id"), Status: row["status"], Error: stringField(row, "error"),
+	}
+}
+
+func firstNonempty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func observabilityHandler(client *observabilityClient) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/observability/logs", func(w http.ResponseWriter, r *http.Request) {
+		runID := r.URL.Query().Get("run_id")
+		if !runIDPattern.MatchString(runID) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "run_id must be a UUID"})
+			return
+		}
+		traceID, spanID, step := r.URL.Query().Get("trace_id"), r.URL.Query().Get("span_id"), r.URL.Query().Get("step")
+		if traceID != "" && !traceIDPattern.MatchString(traceID) || spanID != "" && !spanIDPattern.MatchString(spanID) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "trace_id or span_id is invalid"})
+			return
+		}
+		if step != "" && !stepPattern.MatchString(step) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "step is invalid"})
+			return
+		}
+		now := time.Now().UTC()
+		days := client.retentionDays
+		if days <= 0 {
+			days = 7
+		}
+		where := `run_id = '` + runID + `'`
+		if traceID != "" {
+			where += ` AND trace_id = '` + traceID + `'`
+		}
+		if spanID != "" {
+			where += ` AND span_id = '` + spanID + `'`
+		}
+		if step != "" {
+			where += ` AND step = '` + step + `'`
+		}
+		if attempt := r.URL.Query().Get("attempt"); attempt != "" {
+			var number int
+			if _, err := fmt.Sscan(attempt, &number); err != nil || number < 1 || number > 1000 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "attempt is invalid"})
+				return
+			}
+			where += fmt.Sprintf(" AND (attempt = %d OR attempt IS NULL)", number)
+		}
+		searchStart, searchEnd := now.Add(-time.Duration(days)*24*time.Hour), now
+		if rawStart, rawEnd := r.URL.Query().Get("start"), r.URL.Query().Get("end"); rawStart != "" || rawEnd != "" {
+			started, startErr := time.Parse(time.RFC3339Nano, rawStart)
+			finished, endErr := time.Parse(time.RFC3339Nano, rawEnd)
+			if startErr != nil || endErr != nil || finished.Before(started) {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "start and end must be an ordered RFC3339 interval"})
+				return
+			}
+			// Include immediate boundary logs while excluding other retry attempts in the same trace.
+			lower, upper := started.Add(-time.Second), finished.Add(time.Second)
+			where += fmt.Sprintf(" AND _timestamp >= %d AND _timestamp <= %d", lower.UnixMicro(), upper.UnixMicro())
+			searchStart, searchEnd = lower.Add(-time.Minute), upper.Add(time.Minute)
+		}
+		result, err := client.search(r.Context(), `SELECT * FROM "factory" WHERE `+where+` ORDER BY _timestamp ASC`, searchStart, searchEnd, 250)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+		logs := make([]observabilityLog, 0, len(result.Hits))
+		for _, row := range result.Hits {
+			logs = append(logs, normalizeLog(row))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"logs": logs, "complete": !result.Partial && result.Total <= len(result.Hits),
+			"partial": result.Partial, "truncated": result.Total > len(result.Hits), "total": result.Total,
+		})
+	})
+	mux.HandleFunc("GET /api/observability/spans", func(w http.ResponseWriter, r *http.Request) {
+		traceID := r.URL.Query().Get("trace_id")
+		if !traceIDPattern.MatchString(traceID) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "trace_id must be 32 hexadecimal characters"})
+			return
+		}
+		days := client.retentionDays
+		if days <= 0 {
+			days = 7
+		}
+		now := time.Now().UTC()
+		result, err := client.searchType(r.Context(), `SELECT * FROM "default" WHERE trace_id = '`+traceID+`' ORDER BY start_time ASC`, now.Add(-time.Duration(days)*24*time.Hour), now, 500, "traces")
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+		spans := make([]observabilitySpan, 0, len(result.Hits))
+		for _, row := range result.Hits {
+			spans = append(spans, observabilitySpan{
+				SpanID: stringField(row, "span_id"), ParentSpanID: stringField(row, "parent_span_id", "reference_parent_span_id"),
+				Operation: stringField(row, "operation_name", "name"), Service: stringField(row, "service_name"), Status: stringField(row, "span_status", "status"),
+				Start: row["start_time"], End: row["end_time"], Duration: row["duration"],
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"spans": spans, "complete": !result.Partial && result.Total <= len(result.Hits),
+			"partial": result.Partial, "truncated": result.Total > len(result.Hits), "total": result.Total,
+		})
+	})
+	mux.HandleFunc("GET /api/observability/health", func(w http.ResponseWriter, r *http.Request) {
+		components := map[string]map[string]any{}
+		status := "ok"
+		if !client.configured() {
+			components["logs"] = map[string]any{"status": "unavailable", "reason": "Log search is not configured"}
+			status = "unavailable"
+		} else {
+			now := time.Now().UTC()
+			_, err := client.search(r.Context(), `SELECT _timestamp FROM "factory" ORDER BY _timestamp DESC`, now.Add(-10*time.Minute), now, 1)
+			if err != nil {
+				components["logs"] = map[string]any{"status": "unavailable", "reason": "Cannot query collected logs"}
+				status = "unavailable"
+			} else {
+				components["logs"] = map[string]any{"status": "ok"}
+			}
+		}
+		collector := client.componentHealth(r.Context(), client.collectorBase+"/api/v1/health")
+		if collector["status"] == "ok" {
+			metrics, err := client.getText(r.Context(), client.collectorBase+"/api/v1/metrics/prometheus")
+			if err != nil {
+				collector = map[string]any{"status": "unavailable", "reason": "Cannot read log delivery metrics"}
+			} else if value := failedDeliveryCount(metrics); value > 0 {
+				collector = map[string]any{"status": "degraded", "reason": "Collected logs were dropped or exhausted delivery retries", "lost_records": value}
+			}
+			if storage, err := client.getText(r.Context(), client.collectorBase+"/api/v1/storage"); err == nil {
+				pending, over := storagePressure(storage)
+				collector["pending_chunks"] = pending
+				if over {
+					collector["status"], collector["reason"] = "degraded", "The log delivery buffer is over its configured limit"
+				}
+			}
+		}
+		components["log_delivery"] = collector
+		traces := client.componentHealth(r.Context(), client.tracingHealth)
+		if traces["status"] == "ok" {
+			metrics, err := client.getText(r.Context(), client.tracingMetrics)
+			if err != nil {
+				traces = map[string]any{"status": "unavailable", "reason": "Cannot read trace delivery metrics"}
+			} else if value := failedTraceCount(metrics); value > 0 {
+				traces = map[string]any{"status": "degraded", "reason": "Trace export failures or refused spans were reported", "affected_spans": value}
+			} else if size, capacity := traceQueue(metrics); capacity > 0 {
+				traces["queued_batches"], traces["queue_capacity"] = size, capacity
+				if size/capacity >= .8 {
+					traces["status"], traces["reason"] = "degraded", "The trace delivery queue is near capacity"
+				}
+			}
+		}
+		components["traces"] = traces
+		for _, component := range components {
+			if component["status"] == "unavailable" {
+				status = "unavailable"
+			} else if component["status"] == "degraded" && status == "ok" {
+				status = "degraded"
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": status, "components": components, "retention_days": client.retentionDays})
+	})
+	return mux
+}
+
+func (o *observabilityClient) getText(ctx context.Context, endpoint string) (string, error) {
+	if endpoint == "" {
+		return "", errors.New("endpoint is not configured")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := o.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("health endpoint returned %s", resp.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return string(data), err
+}
+
+func (o *observabilityClient) componentHealth(ctx context.Context, endpoint string) map[string]any {
+	body, err := o.getText(ctx, endpoint)
+	if err != nil {
+		return map[string]any{"status": "unavailable", "reason": "Telemetry component is unreachable"}
+	}
+	var result map[string]any
+	if json.Unmarshal([]byte(body), &result) == nil {
+		state := strings.ToLower(fmt.Sprint(result["status"]))
+		if state != "" && state != "ok" && state != "healthy" && state != "ready" && state != "server available" {
+			return map[string]any{"status": "degraded", "reason": "Telemetry component reports " + state}
+		}
+	}
+	return map[string]any{"status": "ok"}
+}
+
+func failedDeliveryCount(metrics string) float64 {
+	var total float64
+	for _, line := range strings.Split(metrics, "\n") {
+		if strings.HasPrefix(line, "#") || !strings.Contains(line, "fluentbit_output_") {
+			continue
+		}
+		if !strings.Contains(line, "dropped_records_total") && !strings.Contains(line, "retries_failed_total") {
+			continue
+		}
+		if value, ok := prometheusValue(line); ok {
+			total += value
+		}
+	}
+	return total
+}
+
+func failedTraceCount(metrics string) float64 {
+	var total float64
+	for _, line := range strings.Split(metrics, "\n") {
+		if strings.HasPrefix(line, "#") || !strings.HasPrefix(line, "otelcol_") {
+			continue
+		}
+		if !strings.Contains(line, "send_failed_spans") && !strings.Contains(line, "refused_spans") && !strings.Contains(line, "enqueue_failed_spans") {
+			continue
+		}
+		if value, ok := prometheusValue(line); ok {
+			total += value
+		}
+	}
+	return total
+}
+
+func traceQueue(metrics string) (size, capacity float64) {
+	for _, line := range strings.Split(metrics, "\n") {
+		if strings.HasPrefix(line, "#") || !strings.Contains(line, `data_type="traces"`) {
+			continue
+		}
+		value, ok := prometheusValue(line)
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(line, "otelcol_exporter_queue_size") {
+			size += value
+		} else if strings.HasPrefix(line, "otelcol_exporter_queue_capacity") {
+			capacity += value
+		}
+	}
+	return size, capacity
+}
+
+func prometheusValue(line string) (float64, bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return 0, false
+	}
+	var value float64
+	if _, err := fmt.Sscan(fields[len(fields)-2], &value); err == nil && len(fields) > 2 {
+		// Fluent Bit appends a millisecond timestamp; the sample value precedes it.
+		return value, true
+	}
+	if _, err := fmt.Sscan(fields[len(fields)-1], &value); err != nil {
+		return 0, false
+	}
+	return value, true
+}
+
+func storagePressure(raw string) (pending int, over bool) {
+	var root any
+	if json.Unmarshal([]byte(raw), &root) != nil {
+		return 0, false
+	}
+	var walk func(any)
+	walk = func(value any) {
+		switch item := value.(type) {
+		case map[string]any:
+			for key, child := range item {
+				if key == "fs_chunks" {
+					if number, ok := child.(float64); ok {
+						pending += int(number)
+					}
+				}
+				if key == "overlimit" {
+					over = over || child == true
+				}
+				walk(child)
+			}
+		case []any:
+			for _, child := range item {
+				walk(child)
+			}
+		}
+	}
+	walk(root)
+	return pending, over
+}
+
+func validateObservabilityURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" && u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return ""
+	}
+	return raw
+}

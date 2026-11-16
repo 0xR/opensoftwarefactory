@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Open Software Factory</title>
+<link rel="icon" href="data:image/svg+xml,<svg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2028%2028'%20fill='none'%20stroke-width='2.2'%20stroke-linecap='round'%20stroke-linejoin='round'><style>.b{stroke:%23161b24}@media%20(prefers-color-scheme:dark){.b{stroke:%23e7ebf2}}</style><path%20class='b'%20d='M3%2025V12l5.5-4V12l5.5-4V12l5.5-4V25M19%208V4h3.5v5.5M3%2025h22'/><path%20d='M11%2025v-8h6v8'%20fill='rgb(47%20111%20222%20/%20.16)'%20stroke='%232f6fde'/><path%20d='M11%2017l-4-2.5V23l4%202'%20stroke='%232f6fde'/></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="product" href="#workflows" aria-label="Open Software Factory: home">
+    <svg class="logo" width="31" height="31" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 25V12l5.5-4V12l5.5-4V12l5.5-4V25"/>
+      <path d="M19 8V4h3.5v5.5"/>
+      <path d="M3 25h22"/>
+      <path class="logo-door" d="M11 25v-8h6v8"/>
+      <path class="logo-leaf" d="M11 17l-4-2.5V23l4 2"/>
+    </svg>
+    <span>Open Software Factory</span>
+  </a>
+  <nav id="rail" class="menu" aria-label="Pages"></nav>
+  <label id="acting-as" class="acting-as" title="Recorded as creator of runs, versions, decisions, and files">
+    <span class="sr-only">Acting as</span>
+    <input id="creator" autocomplete="name" placeholder="Acting as…" aria-label="Acting as">
+  </label>
+</header>
+
+<main class="content">
+  <div id="page-toggles" class="page-toggles"></div>
+  <!-- Workflows: list – canvas – inspector -->
+  <section class="page page-workflows" id="tab-workflows" hidden>
+    <div class="panel list-panel">
+      <div class="panel-head"><h2>Workflows</h2><span id="wf-new-slot"></span></div>
+      <div class="panel-body"><ul id="wf-list" class="rows" role="listbox" aria-label="Workflows"></ul></div>
+    </div>
+    <div class="canvas-area">
+      <div class="panel-head canvas-head"></div>
+      <div class="canvas-scroll" id="canvas-scroll">
+        <svg id="canvas" aria-label="Workflow graph"></svg>
+        <div id="canvas-message" class="canvas-message" hidden></div>
+      </div>
+      <div class="recent-strip" id="recent-strip" hidden></div>
+    </div>
+    <aside class="panel inspector" id="inspector" aria-label="Inspector"></aside>
+    <datalist id="services"><option value="agent"><option value="gate"><option value="interactive"><option value="route"></datalist>
+  </section>
+
+  <section class="page page-evaluations" id="tab-evaluations" hidden>
+    <div class="panel list-panel">
+      <div class="panel-head"><h2>Evaluation sets</h2><span id="evaluation-new-slot"></span></div>
+      <div class="panel-body"><ul id="evaluation-sets" class="rows" role="listbox" aria-label="Evaluation sets"></ul></div>
+    </div>
+    <div class="panel evaluation-runs">
+      <div class="panel-head"><h2>Runs</h2><span class="panel-actions" id="evaluation-actions"></span></div>
+      <div class="panel-body">
+        <form id="evaluation-filters" class="evaluation-filters"></form>
+        <div id="evaluation-runs"></div>
+      </div>
+    </div>
+    <aside class="panel evaluation-detail" aria-label="Evaluation set">
+      <div class="panel-head"><h2 id="evaluation-detail-title"></h2></div>
+      <div class="panel-body" id="evaluation-detail"></div>
+    </aside>
+  </section>
+
+  <!-- Runs: table and run detail -->
+  <section class="page page-runs" id="tab-runs" hidden>
+    <div class="panel list-panel">
+      <div class="panel-head"><h2>Runs</h2></div>
+      <div class="panel-body"><ul id="runs-workflows" class="rows" role="listbox" aria-label="Workflow"></ul></div>
+    </div>
+    <div class="panel runs-panel">
+      <div class="panel-head"><div class="panel-actions" id="runs-filters"></div></div>
+      <div class="panel-body" id="runs-table"></div>
+    </div>
+    <aside class="panel run-detail" id="run-detail" aria-label="Run"></aside>
+  </section>
+
+  <section class="page page-decisions" id="tab-decisions" hidden>
+    <div class="panel list-panel">
+      <div class="panel-head"><h2>Decisions</h2></div>
+      <div class="panel-body"><ul id="decision-workflows" class="rows" role="listbox" aria-label="Workflow"></ul></div>
+    </div>
+    <div class="panel decisions-panel">
+      <div class="panel-head"></div>
+      <div class="panel-body" id="decision-table"></div>
+    </div>
+    <aside class="panel decision-detail" id="decision-detail" aria-label="Decision"></aside>
+  </section>
+
+  <!-- Sessions: interactive sessions, the chat and file tabs of the selected one, and its files -->
+  <section class="page page-sessions" id="tab-sessions" hidden>
+    <div class="panel list-panel">
+      <div class="panel-head"><h2>Sessions</h2></div>
+      <div class="panel-body"><ul id="session-list" class="rows" role="listbox" aria-label="Sessions"></ul><div id="session-list-state"></div></div>
+    </div>
+    <div class="panel session-main" id="session-main"></div>
+    <aside class="panel session-files" id="session-files" aria-label="Session files"></aside>
+  </section>
+
+  <!-- Team (opened from Runs): channels and members, the chat log and file tabs, and the workspace files -->
+  <section class="page page-teams" id="tab-teams" hidden>
+    <div class="panel list-panel">
+      <div class="panel-head"><h2>Channels</h2></div>
+      <div class="panel-body">
+        <ul id="team-channels" class="rows" role="listbox" aria-label="Channels"></ul>
+        <div id="team-list-state"></div>
+        <h3 id="teamview-members-title" class="section-title teamview-members-title" hidden>Members</h3>
+        <ul id="team-members" class="rows teamview-members" aria-labelledby="teamview-members-title"></ul>
+      </div>
+    </div>
+    <div class="panel teamview-main" id="team-main"></div>
+    <aside class="panel teamview-files" id="team-files" aria-label="Workspace files"></aside>
+  </section>
+
+  <section class="page page-list" id="tab-agents" hidden></section>
+  <section class="page page-list" id="tab-policies" hidden></section>
+
+  <section class="page page-mcp-gateway" id="tab-mcp-gateway" hidden>
+    <div class="panel list-panel" id="mcp-sidebar">
+      <div class="panel-head"><h2>MCP Gateway</h2><span id="mcp-new-slot"></span></div>
+      <div class="panel-body">
+        <ul id="mcp-services" class="rows" role="listbox" aria-label="MCP services"></ul>
+        <div id="mcp-empty"></div>
+      </div>
+    </div>
+    <div class="panel mcp-config">
+      <div class="panel-head"><h2 id="mcp-config-title"></h2></div>
+      <div class="panel-body" id="mcp-config"></div>
+    </div>
+    <aside class="panel mcp-test" aria-label="MCP test">
+      <div class="panel-head"><h2>Test</h2></div>
+      <div class="panel-body" id="mcp-test"></div>
+    </aside>
+  </section>
+
+  <section class="page page-memory" id="tab-artifacts" hidden>
+    <div class="panel list-panel">
+      <div class="panel-head"><h2>Blobstore</h2></div>
+      <div class="panel-body">
+        <ul id="art-tree"></ul>
+      </div>
+    </div>
+    <div class="panel listcol">
+      <div class="panel-head">
+        <form id="trace-form" class="trace-search"><input id="trace-input" placeholder="Trace ID" aria-label="Trace ID" autocomplete="off"></form>
+        <span class="panel-actions"><span id="art-upload-slot"></span></span>
+      </div>
+      <div class="panel-body" id="art-list"></div>
+    </div>
+    <div class="panel content-panel">
+      <div class="panel-head" id="art-detail-head"></div>
+      <div class="panel-body" id="art-detail"></div>
+    </div>
+  </section>
+
+  <section class="page page-cluster" id="tab-cluster" hidden>
+    <div class="panel list-panel">
+      <div class="panel-head"><h2>Cluster</h2></div>
+      <div class="panel-body"><ul id="cluster-tree"></ul></div>
+    </div>
+    <div class="panel content-panel">
+      <div class="panel-head"></div>
+      <div class="panel-body" id="cluster-detail"></div>
+    </div>
+  </section>
+</main>
+
+<div id="saved-notice" class="saved-notice" role="status" aria-live="polite"></div>
+
+<script src="app.js"></script>
+<script src="chat.js"></script>
+<script src="workflowref.js"></script>
+<script src="teams.js"></script>
+<script src="inputs.js"></script>
+<script src="workflows.js"></script>
+<script src="runs.js"></script>
+<script src="evaluations.js"></script>
+<script src="registry.js"></script>
+<script src="agents.js"></script>
+<script src="policies.js"></script>
+<script src="mcp-gateway.js"></script>
+<script src="artifacts.js"></script>
+<script src="decisions.js"></script>
+<script src="sessions.js"></script>
+<script src="cluster.js"></script>
+</body>
+</html>

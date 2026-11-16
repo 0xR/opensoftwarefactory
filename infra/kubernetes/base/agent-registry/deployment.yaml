@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-registry
+  labels:
+    app.kubernetes.io/name: agent-registry
+spec:
+  replicas: 1
+  # Version numbers are allocated in process; keep a single writer.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent-registry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agent-registry
+    spec:
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent-registry
+          image: opensoftwarefactory-registry:local
+          imagePullPolicy: Never
+          args:
+            - -prefix
+            - agents
+            - -files
+            - systemprompt.md,agent.json
+            - -seed
+            - /seed/agents
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: agent-registry
+            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              value: http://telemetry-collector:4318/v1/traces
+            - name: BLOBSTORE_URL
+              value: http://blobstore:8080
+            - name: POLICY_REGISTRY_URL
+              value: http://policy-registry:8080
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

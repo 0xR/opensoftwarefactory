@@ -1,0 +1,16 @@
+log_level: DEBUG
+
+telemetry:
+  endpoint: ""
+  insecure: false
+
+# The factory uses only the models loaded in LM Studio on this machine.
+providers:
+  - name: lm-studio
+    base_url: http://host.lima.internal:1234/v1
+    auth:
+      type: none
+    streaming: true
+    model_discovery: lm-studio # lists and routes only the LLM instances LM Studio has loaded
+    models:
+      qwen3.5-9b-mlx: qwen3.5-9b-mlx

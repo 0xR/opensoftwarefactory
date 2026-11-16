@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal
+  labels:
+    app.kubernetes.io/name: temporal
+  annotations:
+    opensoftwarefactory.dev/url: http://localhost:8233/namespaces/default/workflows
+spec:
+  # NodePort 30233 (the UI) is mapped to localhost:8233 in infra/kind/cluster.yaml.
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: temporal
+  ports:
+    - name: grpc
+      port: 7233
+      targetPort: grpc
+    - name: ui
+      port: 8233
+      targetPort: ui
+      nodePort: 30233

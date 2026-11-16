@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: log-collector
+  labels:
+    app.kubernetes.io/name: log-collector
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush                     1
+        Grace                     30
+        Log_Level                 info
+        Parsers_File              /fluent-bit/etc/parsers.conf
+        HTTP_Server               On
+        HTTP_Listen               0.0.0.0
+        HTTP_Port                 2020
+        Health_Check              On
+        HC_Errors_Count           5
+        HC_Retry_Failure_Count    5
+        HC_Period                 60
+        storage.path              /buffers/chunks
+        storage.sync              full
+        storage.checksum          on
+        storage.max_chunks_up     64
+        storage.backlog.mem_limit 10M
+        storage.metrics           On
+
+    [INPUT]
+        Name              tail
+        Tag               kube.*
+        Path              /var/log/containers/*_opensoftwarefactory_*.log
+        Exclude_Path      /var/log/containers/log-collector-*_opensoftwarefactory_*.log
+        multiline.parser  docker, cri
+        DB                /buffers/tail.db
+        DB.Sync           Full
+        Read_From_Head    On
+        Refresh_Interval  5
+        Inotify_Watcher   False
+        Rotate_Wait       30
+        Skip_Long_Lines   On
+        storage.type      filesystem
+
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Kube_URL            https://kubernetes.default.svc:443
+        Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+        Kube_Tag_Prefix     kube.var.log.containers.
+        Merge_Log           On
+        Keep_Log            Off
+        K8S-Logging.Parser  Off
+        K8S-Logging.Exclude Off
+
+    [FILTER]
+        Name   record_modifier
+        Match  kube.*
+        Record cluster opensoftwarefactory
+
+    [FILTER]
+        Name   lua
+        Match  kube.*
+        script /fluent-bit/config/redact.lua
+        call   redact
+
+    @INCLUDE /credentials/fluent-bit-output.conf
+
+  redact.lua: |
+    local sensitive = {
+      authorization = true,
+      credential = true,
+      credentials = true,
+      password = true,
+      passwd = true,
+      secret = true,
+      token = true,
+      api_key = true,
+      apikey = true
+    }
+
+    local function sensitive_key(key)
+      local normalized = string.lower(tostring(key)):gsub("%-", "_")
+      if sensitive[normalized] then return true end
+      return normalized:match("_password$") ~= nil
+        or normalized:match("_secret$") ~= nil
+        or normalized:match("_token$") ~= nil
+        or normalized:match("_credential$") ~= nil
+    end
+
+    local function scrub(value, depth)
+      if type(value) ~= "table" or depth > 16 then return end
+      for key, child in pairs(value) do
+        if sensitive_key(key) then
+          value[key] = "[REDACTED]"
+        elseif type(child) == "table" then
+          scrub(child, depth + 1)
+        elseif type(child) == "string" then
+          child = child:gsub("([Aa]uthorization[%s:=]+)[Bb]asic%s+[%w%+/=]+", "%1[REDACTED]")
+          child = child:gsub("([Aa]uthorization[%s:=]+)[Bb]earer%s+[%w%-%._~%+/=]+", "%1[REDACTED]")
+          value[key] = child
+        end
+      end
+    end
+
+    function redact(tag, timestamp, record)
+      -- Ingesting this access-log line would generate another identical line forever.
+      if type(record.kubernetes) == "table"
+        and record.kubernetes.container_name == "openobserve"
+        and type(record.log) == "string"
+        and string.find(record.log, "POST /api/default/factory/_json", 1, true) then
+        return -1, timestamp, record
+      end
+      scrub(record, 0)
+      return 1, timestamp, record
+    end

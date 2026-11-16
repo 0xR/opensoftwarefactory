@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: factory-ui
+  labels:
+    app.kubernetes.io/name: factory-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: factory-ui
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: factory-ui
+    spec:
+      serviceAccountName: factory-ui
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: factory-ui
+          image: opensoftwarefactory-factory-ui:local
+          imagePullPolicy: Never
+          env:
+            - name: ORCHESTRATOR_URL
+              value: http://orchestrator:8080
+            - name: AGENT_REGISTRY_URL
+              value: http://agent-registry:8080
+            - name: POLICY_REGISTRY_URL
+              value: http://policy-registry:8080
+            - name: BLOBSTORE_URL
+              value: http://blobstore:8080
+            - name: LLM_GATEWAY_URL
+              value: http://llm-gateway:8080
+            - name: MCP_GATEWAY_URL
+              value: http://mcp-gateway:8080
+            - name: EVALUATION_URL
+              value: http://evaluation:8080
+            - name: AGENT_URL
+              value: http://agent:8080
+            - name: OBSERVABILITY_URL
+              value: http://openobserve:5080
+            - name: OBSERVABILITY_CONFIG
+              value: /openobserve/config/openobserve.env
+            - name: LOG_COLLECTOR_URL
+              value: http://log-collector:2020
+            - name: TRACING_HEALTH_URL
+              value: http://telemetry-collector:13133
+            - name: TRACING_METRICS_URL
+              value: http://telemetry-collector:8888/metrics
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: openobserve-config
+              mountPath: /openobserve/config
+              readOnly: true
+      volumes:
+        - name: openobserve-config
+          hostPath:
+            path: /openobserve/config
+            type: Directory

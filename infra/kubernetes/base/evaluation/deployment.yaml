@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: evaluation
+  labels:
+    app.kubernetes.io/name: evaluation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: evaluation
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: evaluation
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: evaluation
+          image: opensoftwarefactory-evaluation:local
+          imagePullPolicy: Never
+          env:
+            - name: BLOBSTORE_URL
+              value: http://blobstore:8080
+            - name: ORCHESTRATOR_URL
+              value: http://orchestrator:8080
+            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              value: http://telemetry-collector:4318/v1/traces
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { cpu: 300m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

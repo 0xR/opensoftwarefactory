@@ -1,0 +1,299 @@
+# Workflow configuration. Saved by the orchestrator web UI, which does not keep comments.
+#
+# The seeded workflows are the exercises of the Software Factory course, one per session
+# (ex01 to ex09). Their agents and policies are the group `course` in services/registry/seed.
+#
+# Each step runs on the Temporal task queue named by `service`. Steps without
+# depends_on receive the run input; other steps receive the outputs of their
+# dependencies as an ordered list of items. These services are special:
+#   agent  runs the pinned agent named by `agent` (for example course/intake@v1)
+#   gate   waits until a person approves or rejects in the factory UI
+#   route  starts the workflow named in the `route` field of its input artifact
+#   interactive  holds the step while a person works with its agents in a chat session
+#   workflow     runs the workflow version named by `workflow` (for example build@v1) as
+#                a child run; its output is the output of that workflow's single final step
+#   team   a lead agent (`agent`) and other members (`agents`, `workflows`) exchange messages
+#          over `channels` until the lead finishes the team; a gate with `on_reject` sends a
+#          rejection and its reason back to the named team step and reopens afterwards
+#   merge  waits until every step in `depends_on` has delivered and forwards their results
+#          together; `capacity` (default 16) limits the waiting entries, and the run fails when
+#          an entry stays incomplete for `input_timeout` seconds (default 300)
+#   batch  collects results from the steps in `depends_on` and forwards them together once it
+#          holds `size` items, or fewer once `input_timeout` seconds (default 300) have passed
+#          since the last one
+# The steps after a merge or batch run once per forwarded message; pass n of a step stores
+# its artifact as runs/<trace>/<step>.pass-<n>.
+# Steps of a routed workflow store their artifacts under runs/<trace>/<route step>/.
+#
+# The file keeps every version of every workflow: saving a workflow adds an entry with the
+# next `version`. An entry without a version is v1. Workflow references pin a version
+# (name@vN); a reference without one is pinned to the newest version when the file is loaded.
+workflows:
+  - name: ex01-team-standing
+    description: "Session 1 exercise, Where Does Your Team Stand: fill in the worksheet in a chat and get a summary of the chosen practice."
+    steps:
+      - id: worksheet
+        service: interactive
+        agent: course/standing-coach@v1
+        position:
+          x: 260
+          y: 30
+      - id: summary
+        service: agent
+        agent: course/standing-summary@v1
+        timeout: 10m
+        depends_on:
+          - worksheet
+        position:
+          x: 528
+          y: 30
+  - name: ex02-research-workflow
+    description: "Session 2 exercise, Build a Research Workflow: plan a research question, research two sub-questions in parallel, and write one report for a person to accept."
+    steps:
+      - id: plan
+        service: agent
+        agent: course/research-planner@v1
+        timeout: 10m
+        position:
+          x: 260
+          y: 98
+      - id: research-a
+        service: agent
+        agent: course/researcher@v1
+        timeout: 10m
+        depends_on:
+          - plan
+        position:
+          x: 528
+          y: 30
+      - id: research-b
+        service: agent
+        agent: course/researcher@v1
+        timeout: 10m
+        depends_on:
+          - plan
+        position:
+          x: 528
+          y: 166
+      - id: collect
+        service: merge
+        depends_on:
+          - research-a
+          - research-b
+        input_timeout: 1800
+        position:
+          x: 796
+          y: 98
+      - id: report
+        service: agent
+        agent: course/research-writer@v1
+        timeout: 10m
+        depends_on:
+          - collect
+        position:
+          x: 1064
+          y: 98
+      - id: decide
+        service: gate
+        question: Is the research report good enough to use? A rejection needs a reason.
+        depends_on:
+          - report
+        position:
+          x: 1332
+          y: 98
+  - name: ex03-system-design
+    description: "Session 3 exercise, System Design for Your Own Software Factory: design the services with their requirements and approvals, and check the design."
+    steps:
+      - id: design
+        service: agent
+        agent: course/factory-architect@v1
+        timeout: 10m
+        position:
+          x: 260
+          y: 30
+      - id: check
+        service: agent
+        agent: course/design-checker@v1
+        timeout: 10m
+        depends_on:
+          - design
+        position:
+          x: 528
+          y: 30
+      - id: decide
+        service: gate
+        question: Does the checked design describe the factory you want to build?
+        depends_on:
+          - check
+        position:
+          x: 796
+          y: 30
+  - name: ex04-intake-triage
+    description: "Session 4 exercise, Intake and Triage: run the intake checks on a signal, triage the work item by the routing rules, and confirm the triage."
+    steps:
+      - id: intake
+        service: agent
+        agent: course/intake@v1
+        timeout: 10m
+        position:
+          x: 260
+          y: 30
+      - id: triage
+        service: agent
+        agent: course/triage@v1
+        timeout: 10m
+        depends_on:
+          - intake
+        position:
+          x: 528
+          y: 30
+      - id: confirm
+        service: gate
+        question: Is the triage correct, and may the work item go to the proposed next owner?
+        depends_on:
+          - triage
+        position:
+          x: 796
+          y: 30
+  - name: ex05-architecture-review
+    description: "Session 5 exercise, An Architecture Review Agent: review a spec against the current ADRs and the spec policy, and decide on the findings."
+    steps:
+      - id: review
+        service: agent
+        agent: course/architecture-reviewer@v1
+        timeout: 10m
+        position:
+          x: 260
+          y: 30
+      - id: decide
+        service: gate
+        question: Do you accept the reviewer's findings and their decisions for this spec?
+        depends_on:
+          - review
+        position:
+          x: 528
+          y: 30
+  - name: ex06-implementation
+    description: "Session 6 exercise, Compose and Run an Implementation Agent: build one requirement from a spec and a plan, and check what the run hands over."
+    steps:
+      - id: build
+        service: agent
+        agent: course/feature-builder@v1
+        timeout: 10m
+        position:
+          x: 260
+          y: 30
+      - id: check
+        service: agent
+        agent: course/delivery-checker@v1
+        timeout: 10m
+        depends_on:
+          - build
+        position:
+          x: 528
+          y: 30
+      - id: decide
+        service: gate
+        question: Do you take over this delivery to run its checks yourself?
+        depends_on:
+          - check
+        position:
+          x: 796
+          y: 30
+  - name: ex07-guardrails
+    description: "Session 7 exercise, Guardrails for CL-7: write the guardrails for a rule, try to get around them, and decide whether they hold."
+    steps:
+      - id: author
+        service: agent
+        agent: course/guardrail-author@v1
+        timeout: 10m
+        position:
+          x: 260
+          y: 30
+      - id: attack
+        service: agent
+        agent: course/guardrail-attacker@v1
+        timeout: 10m
+        depends_on:
+          - author
+        position:
+          x: 528
+          y: 30
+      - id: decide
+        service: gate
+        question: Do the guardrails stop every attempt well enough to use them?
+        depends_on:
+          - attack
+        position:
+          x: 796
+          y: 30
+  - name: ex08-pr-review
+    description: "Session 8 exercise, Verify and Review a Pull Request: a spec agent and a QA agent check a pull request, and a dossier prepares the decision."
+    steps:
+      - id: spec-review
+        service: agent
+        agent: course/spec-agent@v1
+        timeout: 10m
+        position:
+          x: 260
+          y: 30
+      - id: qa-review
+        service: agent
+        agent: course/qa-agent@v1
+        timeout: 10m
+        position:
+          x: 260
+          y: 166
+      - id: collect
+        service: merge
+        depends_on:
+          - spec-review
+          - qa-review
+        input_timeout: 1800
+        position:
+          x: 528
+          y: 98
+      - id: dossier
+        service: agent
+        agent: course/dossier-writer@v1
+        timeout: 10m
+        depends_on:
+          - collect
+        position:
+          x: 796
+          y: 98
+      - id: decide
+        service: gate
+        question: Do you follow the route the dossier proposes for this pull request?
+        depends_on:
+          - dossier
+        position:
+          x: 1064
+          y: 98
+  - name: ex09-trust-runs
+    description: "Session 9 exercise, Would You Trust These Agent Runs: label agent runs from their records and propose one check for a failure found."
+    steps:
+      - id: label
+        service: agent
+        agent: course/run-reviewer@v1
+        timeout: 10m
+        position:
+          x: 260
+          y: 30
+      - id: check
+        service: agent
+        agent: course/check-author@v1
+        timeout: 10m
+        depends_on:
+          - label
+        position:
+          x: 528
+          y: 30
+      - id: decide
+        service: gate
+        question: Would you add the proposed check to the factory?
+        depends_on:
+          - check
+        position:
+          x: 796
+          y: 30

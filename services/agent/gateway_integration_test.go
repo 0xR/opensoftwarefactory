@@ -1,0 +1,200 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func integrationBuild(t *testing.T, dir, target string) string {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "fixture")
+	cmd := exec.Command("go", "build", "-o", out, target)
+	cmd.Dir = dir
+	if data, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build %s: %v: %s", target, err, data)
+	}
+	return out
+}
+
+func integrationAddr(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
+}
+
+func integrationLaunch(t *testing.T, env []string, binary string, args ...string) {
+	t.Helper()
+	cmd := exec.Command(binary, args...)
+	cmd.Env = append(os.Environ(), env...)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+}
+
+func integrationWaitHTTP(t *testing.T, endpoint string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		response, err := http.Get(endpoint)
+		if err == nil {
+			response.Body.Close()
+			if response.StatusCode/100 == 2 {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("endpoint did not become ready: %s", endpoint)
+}
+
+func integrationPutConfig(t *testing.T, gateway, name string, config map[string]any) {
+	t.Helper()
+	body, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPut, gateway+"/api/services/"+name, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(response.Body)
+		t.Fatalf("configure %s: HTTP %d: %s", name, response.StatusCode, data)
+	}
+}
+
+func integrationToolCall(name, arguments string) toolCall {
+	var call toolCall
+	call.ID = "test-" + name
+	call.Type = "function"
+	call.Function.Name = name
+	call.Function.Arguments = arguments
+	return call
+}
+
+func TestAgentUsesRealGatewayForHTTPAndStdioTools(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and launches integration fixtures")
+	}
+	blobBinary := integrationBuild(t, "../blobstore", ".")
+	gatewayBinary := integrationBuild(t, "../mcp-gateway", ".")
+	mockBinary := integrationBuild(t, "../mcp-gateway", "./testdata/mock")
+
+	blobAddress := integrationAddr(t)
+	blobURL := "http://" + blobAddress
+	integrationLaunch(t, nil, blobBinary, "-addr", blobAddress, "-data", t.TempDir())
+	integrationWaitHTTP(t, blobURL+"/healthz")
+
+	mockAddress := integrationAddr(t)
+	mockURL := "http://" + mockAddress
+	integrationLaunch(t, nil, mockBinary, "-http", mockAddress)
+	integrationWaitHTTP(t, mockURL+"/calls")
+
+	gatewayAddress := integrationAddr(t)
+	gatewayURL := "http://" + gatewayAddress
+	integrationLaunch(t, []string{"BLOBSTORE_URL=" + blobURL}, gatewayBinary, "-addr", gatewayAddress)
+	integrationWaitHTTP(t, gatewayURL+"/healthz")
+
+	policy := map[string]any{"allowlist": []string{"echo", "blocked"}, "denylist": []string{"blocked"}}
+	httpConfig := map[string]any{"transport": "streamable-http", "url": mockURL + "/mcp"}
+	integrationPutConfig(t, gatewayURL, "docs", map[string]any{"mcpconfig": httpConfig, "allowlist": policy["allowlist"], "denylist": policy["denylist"]})
+	stdioCalls := filepath.Join(t.TempDir(), "stdio-calls")
+	stdioConfig := map[string]any{"transport": "stdio", "command": mockBinary, "args": []string{}, "env": map[string]string{"MOCK_CALLS_FILE": stdioCalls}}
+	integrationPutConfig(t, gatewayURL, "code", map[string]any{"mcpconfig": stdioConfig, "allowlist": policy["allowlist"], "denylist": policy["denylist"]})
+
+	service := &Service{
+		MCPGatewayURL: gatewayURL,
+		HTTP:          http.DefaultClient,
+		Logger:        slog.New(slog.DiscardHandler),
+	}
+	modelTools, routes, err := service.discoverTools(context.Background(), []string{"docs/echo", "code/echo", "docs/blocked"}, service.Logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(modelTools) != 2 || routes["docs__echo"].client == nil || routes["code__echo"].client == nil {
+		t.Fatalf("discovered tools/routes = %v / %v", modelTools, routes)
+	}
+	if _, exists := routes["docs__blocked"]; exists {
+		t.Fatal("gateway-denied tool was exposed to the agent")
+	}
+	defer closeToolRoutes(routes, service.Logger)
+
+	for _, tc := range []struct {
+		alias, text string
+	}{
+		{"docs__echo", "from http"},
+		{"code__echo", "from stdio"},
+	} {
+		result, failed, err := service.runTool(context.Background(), routes, integrationToolCall(tc.alias, `{"text":"`+tc.text+`"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if failed {
+			t.Fatalf("%s was reported as a tool failure", tc.alias)
+		}
+		if result != tc.text {
+			t.Fatalf("%s result = %q, want %q", tc.alias, result, tc.text)
+		}
+	}
+
+	deniedClient := &mcpClient{url: gatewayURL + "/mcp/docs", http: http.DefaultClient}
+	if err := deniedClient.connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer deniedClient.close()
+	if _, _, err := deniedClient.callTool(context.Background(), "blocked", json.RawMessage(`{"text":"must not run"}`)); err == nil {
+		t.Fatal("direct gateway call to denied tool succeeded")
+	}
+
+	response, err := http.Get(mockURL + "/calls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var httpCalls []string
+	if err := json.NewDecoder(response.Body).Decode(&httpCalls); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(httpCalls) != 1 || httpCalls[0] != "echo" {
+		t.Fatalf("HTTP upstream calls = %v", httpCalls)
+	}
+	stdioData, err := os.ReadFile(stdioCalls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(stdioData)) != "echo" {
+		t.Fatalf("stdio upstream calls = %q", stdioData)
+	}
+}

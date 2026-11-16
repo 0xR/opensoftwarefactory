@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - llm-gateway
+  - openobserve
+  - log-collector
+  - telemetry-collector
+  - temporal
+  - blobstore
+  - agent-registry
+  - policy-registry
+  - tool-gateway
+  - mcp-gateway
+  - orchestrator
+  - evaluation
+  - agent
+  - factory-ui

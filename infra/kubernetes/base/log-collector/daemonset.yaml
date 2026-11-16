@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: log-collector
+  labels:
+    app.kubernetes.io/name: log-collector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: log-collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: log-collector
+    spec:
+      serviceAccountName: log-collector
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: fluent-bit
+          image: cr.fluentbit.io/fluent/fluent-bit:5.1.5@sha256:2740f387f6e68fab66d28e4fa6a853387b9cab6ffb4cb78958f69bba4eb0e7b4
+          imagePullPolicy: IfNotPresent
+          command: ["/fluent-bit/bin/fluent-bit"]
+          args: ["-c", "/fluent-bit/config/fluent-bit.conf"]
+          ports:
+            - name: metrics
+              containerPort: 2020
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: metrics
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /fluent-bit/config
+              readOnly: true
+            - name: credentials
+              mountPath: /credentials
+              readOnly: true
+            - name: node-logs
+              mountPath: /var/log
+              readOnly: true
+            - name: buffers
+              mountPath: /buffers
+      volumes:
+        - name: config
+          configMap:
+            name: log-collector
+        - name: credentials
+          hostPath:
+            path: /openobserve/config
+            type: Directory
+        - name: node-logs
+          hostPath:
+            path: /var/log
+            type: Directory
+        - name: buffers
+          hostPath:
+            path: /var/lib/opensoftwarefactory/log-collector
+            type: DirectoryOrCreate
