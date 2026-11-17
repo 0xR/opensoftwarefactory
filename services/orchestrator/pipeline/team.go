@@ -44,8 +44,9 @@ const (
 	DefaultMaxTurns = 40
 	// MaxDepth is the deepest nesting of workflow steps and workflow team members a run may reach.
 	MaxDepth = 8
-	// MaxRejections is the number of rejections of a gate with on_reject that fails the run.
-	MaxRejections = 5
+	// DefaultMaxRejections is the number of rejections a gate with on_reject sends back when
+	// it sets no max_rejections; a rejection beyond it fails the run.
+	DefaultMaxRejections = 5
 	// WorkflowSender is the reserved member name under which the orchestrator posts the task
 	// and gate rejections to the lead.
 	WorkflowSender = "workflow"
@@ -195,15 +196,25 @@ type TeamInput struct {
 	// Run changes whenever the team step runs again, so OpenTeam can tell that from a retry.
 	Run       string         `json:"run,omitempty"`
 	Rejection *TeamRejection `json:"rejection,omitempty"`
+	// DevPod is the run's dev pod, nil when the team works without one.
+	DevPod *DevPod `json:"dev_pod,omitempty"`
 }
 
-// TeamTurnRequest is the input of the agent service's TeamTurn activity.
+// TeamTurnRequest is the input of the agent service's TeamTurn activity. DevPod is the ID of
+// the run's dev pod, empty when the run has none.
 type TeamTurnRequest struct {
 	TraceID string `json:"trace_id"`
 	StepID  string `json:"step_id"`
 	Team    string `json:"team"`
 	Member  string `json:"member"`
 	Agent   string `json:"agent"`
+	DevPod  string `json:"dev_pod,omitempty"`
+}
+
+// turnOutcome is what the team loop reads from a finished turn: the reason when the member
+// ended its work with report_blocked.
+type turnOutcome struct {
+	Blocked string `json:"blocked,omitempty"`
 }
 
 // TeamPath names the blob prefix of a team step: "teams/", the run prefix without its
@@ -331,13 +342,17 @@ type nestedRun struct {
 	Depth      int
 	Run        string
 	WorkflowID string
+	// DevPod is the dev pod the nested run works in, nil when it has none.
+	DevPod *DevPod
 }
 
 // NestedResult is the result of a nested workflow: the artifacts of its steps and the
-// items of its single final step, which are the output of the nesting step.
+// items of its single final step, which are the output of the nesting step. Blocked holds
+// the reason when an agent of the nested run ended its work with report_blocked.
 type NestedResult struct {
 	Artifacts map[string]string `json:"artifacts"`
 	Output    []Item            `json:"output"`
+	Blocked   string            `json:"blocked,omitempty"`
 }
 
 // startNested resolves the referenced workflow version against the stored configuration and
@@ -371,8 +386,13 @@ func startNested(ctx, ownCtx workflow.Context, run nestedRun) workflow.Future {
 			Prefix:     run.Prefix,
 			Depth:      run.Depth,
 			Run:        run.Run,
+			DevPod:     run.DevPod,
 		}).Get(ctx, &child); err != nil {
 			setter.Set(nil, err)
+			return
+		}
+		if child.Blocked != "" {
+			setter.Set(NestedResult{Artifacts: child.Artifacts, Blocked: child.Blocked}, nil)
 			return
 		}
 		if len(child.Final) == 0 {
@@ -430,6 +450,11 @@ func Team(ctx workflow.Context, in TeamInput) (StepResult, error) {
 	turns := 0
 	nudges := 0
 	var failure error
+	blocked := ""
+	pod := ""
+	if in.DevPod != nil {
+		pod = in.DevPod.ID
+	}
 	for {
 		var state TeamStateResult
 		if err := workflow.ExecuteActivity(ownCtx, TeamStateActivity, TeamStateRequest{Team: in.Team}).Get(ctx, &state); err != nil {
@@ -461,13 +486,17 @@ func Team(ctx workflow.Context, in TeamInput) (StepResult, error) {
 					turn = startMemberRun(ctx, ownCtx, in, member, opened.Round, runs[name])
 				} else {
 					turn = workflow.ExecuteActivity(turnCtx, TeamTurnActivity, TeamTurnRequest{
-						TraceID: in.TraceID, StepID: in.Step.ID, Team: in.Team, Member: name, Agent: member.Ref,
+						TraceID: in.TraceID, StepID: in.Step.ID, Team: in.Team, Member: name, Agent: member.Ref, DevPod: pod,
 					})
 				}
 				selector.AddFuture(turn, func(f workflow.Future) {
 					delete(running, name)
-					if err := f.Get(ctx, nil); err != nil && failure == nil {
+					var out turnOutcome
+					if err := f.Get(ctx, &out); err != nil && failure == nil {
 						failure = fmt.Errorf("turn of team member %q failed: %w", name, err)
+					}
+					if out.Blocked != "" && blocked == "" {
+						blocked = out.Blocked
 					}
 				})
 			}
@@ -491,6 +520,10 @@ func Team(ctx workflow.Context, in TeamInput) (StepResult, error) {
 		if failure != nil {
 			return StepResult{}, failure
 		}
+		// A member that reported itself blocked ends the team; the other turns are abandoned.
+		if blocked != "" {
+			return StepResult{Blocked: blocked}, nil
+		}
 	}
 }
 
@@ -510,7 +543,7 @@ func startMemberRun(ctx, ownCtx workflow.Context, in TeamInput, member TeamMembe
 			return
 		}
 		if task.Channel == "" {
-			setter.Set(nil, nil)
+			setter.Set(turnOutcome{}, nil)
 			return
 		}
 		var nested NestedResult
@@ -519,8 +552,13 @@ func startMemberRun(ctx, ownCtx workflow.Context, in TeamInput, member TeamMembe
 			Inputs:     []Item{{Source: InputSource, Artifact: task.Artifact, Round: 1}},
 			WorkflowID: fmt.Sprintf("%s/%s.r%d.%d", workflow.GetInfo(ctx).WorkflowExecution.ID, member.Name, round, n),
 			Run:        fmt.Sprintf("%s/r%d.%d", in.Run, round, n),
+			DevPod:     in.DevPod,
 		}).Get(ctx, &nested); err != nil {
 			setter.Set(nil, err)
+			return
+		}
+		if nested.Blocked != "" {
+			setter.Set(turnOutcome{Blocked: nested.Blocked}, nil)
 			return
 		}
 		reply := PostTeamMessageRequest{
@@ -530,7 +568,7 @@ func startMemberRun(ctx, ownCtx workflow.Context, in TeamInput, member TeamMembe
 		for _, item := range nested.Output {
 			reply.Artifacts = append(reply.Artifacts, item.Artifact)
 		}
-		setter.Set(nil, workflow.ExecuteActivity(ownCtx, PostTeamMessageActivity, reply).Get(ctx, nil))
+		setter.Set(turnOutcome{}, workflow.ExecuteActivity(ownCtx, PostTeamMessageActivity, reply).Get(ctx, nil))
 	})
 	return future
 }

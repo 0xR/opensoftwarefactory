@@ -67,7 +67,9 @@ def public_functions(module: ModuleType) -> list[Any]:
     ]
 
 
-MAX_ERROR_TEXT = 500
+# Long enough for a refusal that names the rule, the reason and what to do instead, with a
+# list of allowed commands.
+MAX_ERROR_TEXT = 2000
 
 
 def reporting_errors(fn: Any) -> Any:

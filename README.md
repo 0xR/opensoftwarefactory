@@ -53,6 +53,7 @@ A thin software factory on a single-node KIND cluster. Temporal workflows chain 
 services/
   agent/              Runs agent steps: models via the LLM gateway, tools via MCP (Go)
   blobstore/          Stores every artifact with its creator and trace ID (Go)
+  connectors/         Git repositories, dev pods, and the rules for agents working in them (Go)
   factory-ui/         The web UI and the proxy to the service APIs (Go; the UI is in web/)
   llm-gateway/        OpenAI-compatible proxy to the model providers (Go)
   mcp-gateway/        MCP passthrough routing, tool filtering, and stdio process management (Go)
@@ -64,7 +65,7 @@ infra/
   kind/               KIND cluster configuration
   kubernetes/
     base/             One directory per deployment, temporal included
-    overlays/local/   Puts everything in the opensoftwarefactory namespace
+    overlays/local/   Puts the factory in the opensoftwarefactory namespace and adds the dev pod namespace
 scripts/              Node scripts that create the local and cluster configuration
 justfile              The commands below and the list of services
 package.json          Node settings for scripts/ (ES modules, Node 24+)

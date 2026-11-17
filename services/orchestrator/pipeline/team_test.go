@@ -339,25 +339,26 @@ func TestGateOnRejectSendsTheReasonBackToTheTeamAndReopens(t *testing.T) {
 	}
 }
 
-func TestGateOnRejectFailsTheRunAfterFiveRejections(t *testing.T) {
+// A gate sends five rejections back by default; the sixth ends the run.
+func TestGateOnRejectFailsTheRunWithTheRejectionBeyondItsLimit(t *testing.T) {
 	env, store, _ := teamEnv(t, []Definition{echoWorkflow}, cooperative)
 	_ = store.Put(context.Background(), "runs/t6/input", []byte("task"), Meta{})
-	for round := 1; round <= MaxRejections; round++ {
+	for round := 1; round <= DefaultMaxRejections+1; round++ {
 		env.RegisterDelayedCallback(func() {
 			env.SignalWorkflow(DecisionSignal, Decision{Step: "review", Decision: Rejected, Comment: fmt.Sprintf("no %d", round), DecidedBy: "flo"})
 		}, time.Duration(round)*time.Second)
 	}
 	env.ExecuteWorkflow(Pipeline, Input{TraceID: "t6", Definition: reviewed(), Inputs: runInput("runs/t6/input")})
 	err := env.GetWorkflowError()
-	if err == nil || !strings.Contains(err.Error(), `step "review" rejected 5 times, last by flo: no 5`) {
+	if err == nil || !strings.Contains(err.Error(), `step "review" rejected 6 times, last by flo: no 6`) {
 		t.Fatalf("error %v", err)
 	}
-	for _, id := range []string{"runs/t6/review.1", "runs/t6/review.4", "runs/t6/review"} {
+	for _, id := range []string{"runs/t6/review.1", "runs/t6/review.5", "runs/t6/review"} {
 		if !store.has(id) {
 			t.Errorf("record %s is missing", id)
 		}
 	}
-	if store.has("runs/t6/review.5") {
+	if store.has("runs/t6/review.6") {
 		t.Error("the last rejection belongs in the gate's own artifact")
 	}
 }
@@ -469,9 +470,9 @@ func TestValidateTeamAndWorkflowSteps(t *testing.T) {
 		"channel case":        {change(func(a, _, _ *Step) { a.Workflows = []string{"Docs"}; a.Channels = [][]string{{"lead", "docs"}} }), `has a channel to "docs", but the member is named "Docs"`},
 		"member in two cases": {change(func(a, _, _ *Step) { a.Channels = [][]string{{"lead", "Lead"}} }), `has a channel to "Lead", but the member is named "lead"`},
 		"negative turns":      {change(func(a, _, _ *Step) { a.MaxTurns = -1 }), "max_turns"},
-		"on_reject unknown":   {change(func(_, b, _ *Step) { b.OnReject = "gone" }), "on_reject must name a team step"},
-		"on_reject no team":   {change(func(_, b, _ *Step) { b.OnReject = "other"; b.DependsOn = []string{"team", "other"} }), "on_reject must name a team step"},
-		"on_reject no dep":    {change(func(_, b, _ *Step) { b.DependsOn = []string{"other"} }), "on_reject must name a team step"},
+		"on_reject unknown":   {change(func(_, b, _ *Step) { b.OnReject = "gone" }), "on_reject must name an agent, interactive, team, or workflow step"},
+		"on_reject no team":   {change(func(_, b, _ *Step) { b.OnReject = "other"; b.DependsOn = []string{"team", "other"} }), "on_reject must name an agent, interactive, team, or workflow step"},
+		"on_reject no dep":    {change(func(_, b, _ *Step) { b.DependsOn = []string{"other"} }), "on_reject must name an agent, interactive, team, or workflow step"},
 		"on_reject on agent":  {change(func(_, _, c *Step) { c.OnReject = "team" }), "only a gate step"},
 		"no workflow name":    {change(func(_, _, c *Step) { c.Workflow = "" }), "needs the workflow it runs"},
 	} {

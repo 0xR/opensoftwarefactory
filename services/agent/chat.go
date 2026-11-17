@@ -28,6 +28,8 @@ type sessionChatRequest struct {
 	Agent     string `json:"agent"`
 	Message   string `json:"message"`
 	CreatedBy string `json:"created_by"`
+	// DevPod is the run's dev pod; empty when the run has none.
+	DevPod string `json:"dev_pod,omitempty"`
 }
 
 // chatLog is the stored history of one tab, <session>/chats/<tab>.json. Messages is the
@@ -232,6 +234,7 @@ func (s *Service) Chat(ctx context.Context, req sessionChatRequest) (reply, chat
 		trace.WithAttributes(attribute.String("factory.run_id", req.TraceID), attribute.String("factory.step", req.StepID), attribute.String("factory.agent", ref)))
 	defer span.End()
 	ctx = withCorrelation(ctx, StepRequest{TraceID: req.TraceID, StepID: req.StepID, Agent: ref, OutputArtifact: chatID}, ref, 1)
+	ctx = withDevPod(ctx, req.DevPod, ref, req.TraceID)
 	ctx, cancel := context.WithTimeout(ctx, chatTurnTimeout)
 	defer cancel()
 	log := s.Logger.With("run_id", req.TraceID, "step", req.StepID, "agent", ref, "chat", chatID, "created_by", req.CreatedBy)
@@ -283,7 +286,11 @@ func (s *Service) Chat(ctx context.Context, req sessionChatRequest) (reply, chat
 			return "", chatID, 0, err
 		}
 		history.Created = now
-		if err := history.add(map[string]string{"role": "system", "content": prompt + sessionNote(req.Session)}); err != nil {
+		note := sessionNote(req.Session)
+		if strings.TrimSpace(req.DevPod) != "" {
+			note += devPodNote(def.Commands)
+		}
+		if err := history.add(map[string]string{"role": "system", "content": prompt + note}); err != nil {
 			return "", chatID, 0, err
 		}
 	}
@@ -387,6 +394,14 @@ func (s *Service) chatTurn(ctx context.Context, ref string, def Definition, hist
 			log.Info("tool call completed", "tool", tc.Function.Name, "turn", calls, "failed", toolFailed)
 			if err := history.add(map[string]string{"role": "tool", "tool_call_id": tc.ID, "content": text}); err != nil {
 				return "", err
+			}
+			// A successful report_blocked ends the turn at once: the reason is the answer.
+			if reason, ok := blockedReason(ctx); ok {
+				// Every tool call needs an answer, or the stored history could not be sent again.
+				for _, open := range c.ToolCalls[i+1:] {
+					_ = history.add(map[string]string{"role": "tool", "tool_call_id": open.ID, "content": "Not run: the turn ended because you reported that you are blocked."})
+				}
+				return reason, nil
 			}
 		}
 		if err := teamTurnStopped(ctx); err != nil {

@@ -465,7 +465,7 @@ test("a completed session is read-only and names the submitted file", async () =
   assert.deepEqual(ui.tabs(), ["triage", "summary.md"]);
   assert.equal(ui.activePane().all().find((e) => e.attributes["aria-label"] === "Edit file").hidden, true);
   ui.find(ui.files, ".rows")[0].children[0].dispatch("contextmenu");
-  assert.deepEqual(plain(ui.context.lastMenu.map((item) => item[0])), ["Open"]);
+  assert.deepEqual(plain(ui.context.lastMenu.map((item) => item[0])), ["Open", "Download"]);
 });
 
 test("Complete submits the chosen file once, as the acting person, and locks the session", async () => {
@@ -557,13 +557,13 @@ test("deleting a file asks first and closes its tab", async () => {
   row().dispatch("click");
   await flush();
   row().dispatch("contextmenu");
-  assert.deepEqual(plain(ui.context.lastMenu.map((item) => (Array.isArray(item) ? item[0] : item))), ["Open", "-", "Delete"]);
+  assert.deepEqual(plain(ui.context.lastMenu.map((item) => (Array.isArray(item) ? item[0] : item))), ["Open", "Download", "-", "Delete"]);
   ui.setConfirm(false);
-  ui.context.lastMenu[2][1]();
+  ui.context.lastMenu[3][1]();
   await flush();
   assert.equal(ui.calls.filter((c) => c.method === "DELETE").length, 0, "nothing is deleted without the confirmation");
   ui.setConfirm(true);
-  ui.context.lastMenu[2][1]();
+  ui.context.lastMenu[3][1]();
   await flush();
   assert.deepEqual(ui.calls.filter((c) => c.method === "DELETE").map((c) => c.path), [`/api/blobs/blobs/${SESSION}/files/a.md`]);
   assert.deepEqual(ui.find(ui.files, ".row-title").map((r) => r.textContent), ["b.md"]);
@@ -665,7 +665,7 @@ test("the hash names the session, also one of a routed child run; a waiting one 
   await page.show("/done/talk");
   assert.equal(page.mounts.length, 2);
   assert.ok(page.mounts[0].destroyed);
-  assert.deepEqual(plain({ ...page.mounts[1].options, onComplete: undefined, filesContainer: undefined }), { session: "user-sessions/done/talk", traceId: "done", workflow: "bug-triage", step: "talk", closed: true });
+  assert.deepEqual(plain({ ...page.mounts[1].options, onComplete: undefined, filesContainer: undefined }), { session: "user-sessions/done/talk", traceId: "done", workflow: "bug-triage", step: "talk", devPod: "", closed: true });
   assert.deepEqual(page.rows().map((r) => r.title), ["Bug Triage › Talk", "Bug Triage › Talk", "Bug Triage › Talk"], "kept in the list while the page is open");
 
   // A session that does not exist gives way to the open one; nothing new is mounted.

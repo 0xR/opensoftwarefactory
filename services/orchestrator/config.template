@@ -95,6 +95,7 @@ workflows:
           y: 98
       - id: decide
         service: gate
+        on_reject: report
         question: Is the research report good enough to use? A rejection needs a reason.
         depends_on:
           - report
@@ -122,6 +123,7 @@ workflows:
           y: 30
       - id: decide
         service: gate
+        on_reject: design
         question: Does the checked design describe the factory you want to build?
         depends_on:
           - check
@@ -149,6 +151,7 @@ workflows:
           y: 30
       - id: confirm
         service: gate
+        on_reject: triage
         question: Is the triage correct, and may the work item go to the proposed next owner?
         depends_on:
           - triage
@@ -167,6 +170,7 @@ workflows:
           y: 30
       - id: decide
         service: gate
+        on_reject: review
         question: Do you accept the reviewer's findings and their decisions for this spec?
         depends_on:
           - review
@@ -174,85 +178,214 @@ workflows:
           x: 528
           y: 30
   - name: ex06-implementation
-    description: "Session 6 exercise, Compose and Run an Implementation Agent: build one requirement from a spec and a plan, and check what the run hands over."
+    description: "Session 6 exercise: an agent builds requirement R4 in a dev pod, the checks run, and the result is delivered as a pull request."
     steps:
-      - id: build
-        service: agent
-        agent: course/feature-builder@v1
-        timeout: 10m
+      - id: pod
+        service: devpod
+        repository: claims-build
+        source_branch: main
+        work_branch: agent/payment-date-{run}
+        protected:
+          - tests/**
+          - src/claims_system.py
+          - verify.sh
+          - run.sh
         position:
           x: 260
           y: 30
-      - id: check
-        service: agent
-        agent: course/delivery-checker@v1
-        timeout: 10m
+      - id: baseline
+        service: command
+        command: ./verify.sh
+        allow_failure: true
+        timeout: 2m
         depends_on:
-          - build
-        position:
-          x: 528
-          y: 30
-      - id: decide
-        service: gate
-        question: Do you take over this delivery to run its checks yourself?
-        depends_on:
-          - check
-        position:
-          x: 796
-          y: 30
-  - name: ex07-guardrails
-    description: "Session 7 exercise, Guardrails for CL-7: write the guardrails for a rule, try to get around them, and decide whether they hold."
-    steps:
-      - id: author
-        service: agent
-        agent: course/guardrail-author@v1
-        timeout: 10m
-        position:
-          x: 260
-          y: 30
-      - id: attack
-        service: agent
-        agent: course/guardrail-attacker@v1
-        timeout: 10m
-        depends_on:
-          - author
-        position:
-          x: 528
-          y: 30
-      - id: decide
-        service: gate
-        question: Do the guardrails stop every attempt well enough to use them?
-        depends_on:
-          - attack
-        position:
-          x: 796
-          y: 30
-  - name: ex08-pr-review
-    description: "Session 8 exercise, Verify and Review a Pull Request: a spec agent and a QA agent check a pull request, and a dossier prepares the decision."
-    steps:
-      - id: spec-review
-        service: agent
-        agent: course/spec-agent@v1
-        timeout: 10m
-        position:
-          x: 260
-          y: 30
-      - id: qa-review
-        service: agent
-        agent: course/qa-agent@v1
-        timeout: 10m
+          - pod
         position:
           x: 260
           y: 166
+      - id: build
+        service: agent
+        agent: course/feature-builder@v1
+        timeout: 20m
+        depends_on:
+          - baseline
+        position:
+          x: 260
+          y: 302
+      - id: verify
+        service: command
+        command: ./verify.sh
+        timeout: 2m
+        depends_on:
+          - build
+        position:
+          x: 260
+          y: 438
+      - id: deliver
+        service: agent
+        agent: course/delivery-agent@v1
+        timeout: 10m
+        depends_on:
+          - build
+          - verify
+        position:
+          x: 260
+          y: 574
+      - id: decide
+        service: gate
+        question: Do you accept this pull request for R4? A rejection needs a reason and goes back to the builder.
+        on_reject: build
+        depends_on:
+          - deliver
+        position:
+          x: 260
+          y: 710
+  - name: ex07-guardrails
+    description: "Session 7 exercise: an agent fixes the incident while a rule blocks the forbidden text of CL-7, and the handover script rejects a change made through the shell."
+    steps:
+      - id: pod
+        service: devpod
+        repository: claims-portal
+        source_branch: main
+        work_branch: agent/incident-{run}
+        protected:
+          - checks/**
+          - handover.sh
+          - policies/**
+        rules:
+          - tool: write_file
+            path: src/panel.py
+            matches: rejection.?reason
+            message: 'Blocked by CL-7: this portal panel may not show why a claim was rejected. Show "Rejected. Call your claims handler:" and the phone number of the claims handler instead.'
+          - tool: edit_file
+            path: src/panel.py
+            matches: rejection.?reason
+            message: 'Blocked by CL-7: this portal panel may not show why a claim was rejected. Show "Rejected. Call your claims handler:" and the phone number of the claims handler instead.'
+        position:
+          x: 260
+          y: 30
+      - id: fix
+        service: agent
+        agent: course/incident-fixer@v1
+        timeout: 20m
+        depends_on:
+          - pod
+        position:
+          x: 260
+          y: 166
+      - id: handover
+        service: command
+        command: ./handover.sh
+        timeout: 2m
+        depends_on:
+          - fix
+        position:
+          x: 260
+          y: 302
+      - id: tamper-with-check
+        service: command
+        command: echo "print('ok')" > checks/check_cl7.py
+        allow_failure: true
+        timeout: 2m
+        depends_on:
+          - handover
+        position:
+          x: 260
+          y: 438
+      - id: shell-change
+        service: command
+        command: |-
+          cat > src/panel.py <<'PY'
+          import sys
+
+          from src.claims_system import get_claim
+
+
+          def status_panel(claim_id):
+              claim = get_claim(claim_id)
+              if claim["status"] == "Rejected":
+                  return "Rejected: " + claim["rejection_reason"]
+              return claim["status"] + "."
+
+
+          if __name__ == "__main__":
+              print(status_panel(int(sys.argv[1])))
+          PY
+          ./panel.sh 2042
+        allow_failure: true
+        timeout: 2m
+        depends_on:
+          - tamper-with-check
+        position:
+          x: 260
+          y: 574
+      - id: handover-again
+        service: command
+        command: ./handover.sh
+        allow_failure: true
+        timeout: 2m
+        depends_on:
+          - shell-change
+        position:
+          x: 260
+          y: 710
+      - id: decide
+        service: gate
+        question: Did each guardrail stop what it should? The handover after the fix must accept, and the handover after the shell change must reject.
+        depends_on:
+          - handover-again
+        position:
+          x: 260
+          y: 846
+  - name: ex08-pr-review
+    description: "Session 8 exercise: a spec agent and a QA agent check the author agent's commit in a dev pod, and a dossier goes to the person who decides."
+    steps:
+      - id: pod
+        service: devpod
+        repository: claims-review
+        source_branch: main
+        work_branch: review/{run}
+        position:
+          x: 268
+          y: 30
+      - id: spec-review
+        service: agent
+        agent: course/spec-agent@v1
+        timeout: 15m
+        depends_on:
+          - pod
+        position:
+          x: 0
+          y: 166
+      - id: qa-review
+        service: agent
+        agent: course/qa-agent@v1
+        timeout: 15m
+        depends_on:
+          - pod
+        position:
+          x: 268
+          y: 166
+      - id: tests
+        service: command
+        command: ./test.sh
+        allow_failure: true
+        timeout: 2m
+        depends_on:
+          - pod
+        position:
+          x: 536
+          y: 166
       - id: collect
         service: merge
+        input_timeout: 1800
         depends_on:
           - spec-review
           - qa-review
-        input_timeout: 1800
+          - tests
         position:
-          x: 528
-          y: 98
+          x: 268
+          y: 302
       - id: dossier
         service: agent
         agent: course/dossier-writer@v1
@@ -260,16 +393,17 @@ workflows:
         depends_on:
           - collect
         position:
-          x: 796
-          y: 98
+          x: 268
+          y: 438
       - id: decide
         service: gate
-        question: Do you follow the route the dossier proposes for this pull request?
+        question: What do you decide about this pull request? A rejection needs a reason and goes back to the dossier writer.
+        on_reject: dossier
         depends_on:
           - dossier
         position:
-          x: 1064
-          y: 98
+          x: 268
+          y: 574
   - name: ex09-trust-runs
     description: "Session 9 exercise, Would You Trust These Agent Runs: label agent runs from their records and propose one check for a failure found."
     steps:
@@ -291,6 +425,7 @@ workflows:
           y: 30
       - id: decide
         service: gate
+        on_reject: check
         question: Would you add the proposed check to the factory?
         depends_on:
           - check

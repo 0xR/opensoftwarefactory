@@ -244,3 +244,27 @@ test("Unpack inputs is a tickbox bound to the boolean unpack_inputs in agent.jso
   // A new agent starts with true.
   assert.match(source, /max_retries: 0,\n        unpack_inputs: true,\n      \}, null, 2\)/);
 });
+
+test("Commands lists the command patterns of agent.json one per line and leaves an empty list out", async () => {
+  const { nodes, area } = setup();
+  await settle();
+  const commands = nodes.find((node) => node.tag === "textarea" && node.id === "agent-commands");
+  assert.ok(commands, "the Commands field exists");
+  const label = nodes.find((node) => node.tag === "label" && node.children.includes("Commands"));
+  assert.match(label.props.title, /may run in a dev pod/);
+  assert.match(label.props.title, /\* stands for any text/);
+  assert.match(label.props.title, /Nothing listed means no command/);
+  assert.equal(commands.props.placeholder, "No commands");
+  assert.equal(commands.value, "", "an agent without commands");
+  commands.value = "./verify.sh\n\n  git status*  \npython3 -m unittest *\n";
+  commands.events.input();
+  assert.deepEqual(JSON.parse(area.value).commands, ["./verify.sh", "git status*", "python3 -m unittest *"]);
+  assert.deepEqual(JSON.parse(area.value).models, ["local"], "the other settings stay");
+  // An edit of the JSON shows in the field.
+  area.value = JSON.stringify({ models: ["local"], commands: ["git diff*", "git log*"] });
+  area.events.input();
+  assert.equal(commands.value, "git diff*\ngit log*");
+  commands.value = "  \n";
+  commands.events.input();
+  assert.equal("commands" in JSON.parse(area.value), false, "nothing listed: no command is allowed");
+});

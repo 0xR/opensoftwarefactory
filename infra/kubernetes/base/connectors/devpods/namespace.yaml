@@ -1,0 +1,5 @@
+# Dev pods run in a namespace of their own, apart from the factory's services.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: opensoftwarefactory-devpods

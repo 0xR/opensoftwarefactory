@@ -51,6 +51,8 @@ type RunMetadata struct {
 	InputArtifact      string            `json:"input_artifact"`
 	// Agents maps an agent reference to its AgentSettings, or to an agentError.
 	Agents map[string]any `json:"agents"`
+	// DevPod is the run's dev pod. The pipeline adds it when a devpod step created the pod.
+	DevPod *pipeline.DevPod `json:"dev_pod,omitempty"`
 }
 
 // runMetadata collects what produces a run: the workflow version, the nested workflow
@@ -181,7 +183,7 @@ func (s *server) storedStatus(ctx context.Context, trace string) (RunStatus, boo
 		return RunStatus{}, false
 	}
 	// The names are those the run history gives a finished run.
-	status, ok := map[string]string{"completed": "Completed", "failed": "Failed", "cancelled": "Canceled"}[meta.Status]
+	status, ok := map[string]string{"completed": "Completed", "failed": "Failed", "cancelled": "Canceled", "blocked": "Blocked"}[meta.Status]
 	if !ok {
 		return RunStatus{}, false
 	}

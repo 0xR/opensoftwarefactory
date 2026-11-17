@@ -34,6 +34,8 @@ spec:
               value: http://blobstore:8080
             - name: POLICY_REGISTRY_URL
               value: http://policy-registry:8080
+            - name: CONNECTORS_URL
+              value: http://connectors:8080
           ports:
             - name: http
               containerPort: 8080

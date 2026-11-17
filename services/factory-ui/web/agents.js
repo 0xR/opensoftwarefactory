@@ -22,6 +22,13 @@ function modelSetting(typed) {
   return n >= 0 && n <= 2 ? n : null;
 }
 
+// commandLines reads the command patterns of an agent: the stored list, or the typed text with
+// one pattern per line. Empty lines and anything that is not text are left out.
+function commandLines(value) {
+  const lines = Array.isArray(value) ? value : String(value ?? "").split("\n");
+  return lines.filter((line) => typeof line === "string").map((line) => line.trim()).filter(Boolean);
+}
+
 // agentFields shows the settings of agent.json as fields beside it: a changed field rewrites
 // the JSON, and an edit of the JSON updates the fields. The models, with whether each is
 // available now, come from the LLM gateway, which maps every model name to a provider's model.
@@ -67,6 +74,8 @@ function agentFields(area, areas = {}) {
   const description = h("input", { autocomplete: "off", placeholder: "No description" });
   // unpack_inputs is required in agent.json: ticked, the first message holds the inputs' content.
   const unpack = h("input", { type: "checkbox" });
+  // commands is the optional list of command patterns the agent may run in a dev pod, one per line.
+  const commands = h("textarea", { rows: 2, placeholder: "No commands", spellcheck: false, autocomplete: "off" });
   const texts = [description];
 
   const selectedPolicies = () => {
@@ -111,7 +120,7 @@ function agentFields(area, areas = {}) {
   const box = h("div", { className: "file-fields" });
   function refresh() {
     const d = read();
-    for (const c of [model, effort, temperature, retries, tools, policies, unpack, ...texts]) { c.disabled = !d; c.title = d ? "" : "Needs valid JSON in agent.json"; }
+    for (const c of [model, effort, temperature, retries, tools, policies, unpack, commands, ...texts]) { c.disabled = !d; c.title = d ? "" : "Needs valid JSON in agent.json"; }
     if (!d) return;
     renderModel(Array.isArray(d.models) ? d.models[0] || "" : "");
     renderEffort(typeof d.effort === "string" ? d.effort : "");
@@ -123,6 +132,7 @@ function agentFields(area, areas = {}) {
     renderPolicies();
     unpack.checked = d.unpack_inputs === true;
     if (document.activeElement !== description) description.value = d.description ?? "";
+    if (document.activeElement !== commands) { commands.value = commandLines(d.commands).join("\n"); growCommands(); }
     requestAnimationFrame(() => { for (const c of [model, effort, ...texts]) if (c.isConnected) fitWidth(c); });
   }
 
@@ -138,6 +148,12 @@ function agentFields(area, areas = {}) {
   temperature.addEventListener("input", () => write((d) => { const n = modelSetting(temperature.value); if (n === null) delete d.temperature; else d.temperature = n; }));
   description.addEventListener("input", () => write((d) => { d.description = description.value; }));
   unpack.addEventListener("change", () => write((d) => { d.unpack_inputs = unpack.checked; }));
+  // One pattern per line; a list without patterns is left out, which allows no command.
+  const growCommands = () => { commands.rows = Math.max(2, commands.value.split("\n").length); };
+  commands.addEventListener("input", () => {
+    growCommands();
+    write((d) => { const list = commandLines(commands.value); if (list.length) d.commands = list; else delete d.commands; });
+  });
   for (const t of texts) t.addEventListener("input", () => fitWidth(t));
   area.addEventListener("input", () => { if (!writing) refresh(); });
   promptArea?.addEventListener("input", renderPolicies);
@@ -282,6 +298,8 @@ function agentFields(area, areas = {}) {
   const unpackField = h("div", { className: "field check-field" },
     h("label", { htmlFor: unpack.id, title: "Ticked, the first message holds the content of every input; unticked, the agent gets only the object IDs and reads them with get_artifact" },
       unpack, "Unpack inputs into the first message"));
+  const commandsField = field("Commands", commands, "The commands this agent may run in a dev pod, one pattern per line; * stands for any text, and a command must match one pattern completely. Nothing listed means no command", "commands");
+  commandsField.classList.add("agent-commands");
   box.append(
     modelField,
     field("Effort", effort, "How much the model thinks before it answers. None skips the thinking; the others are sent to the model as reasoning_effort", "effort"),
@@ -291,6 +309,7 @@ function agentFields(area, areas = {}) {
     policiesField,
     field("Description", description, "What the agent is for, in a few words", "description"),
     unpackField,
+    commandsField,
   );
   refresh();
   fetchModels();

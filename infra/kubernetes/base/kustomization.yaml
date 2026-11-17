@@ -11,6 +11,8 @@ resources:
   - policy-registry
   - tool-gateway
   - mcp-gateway
+  - git-host
+  - connectors
   - orchestrator
   - evaluation
   - agent

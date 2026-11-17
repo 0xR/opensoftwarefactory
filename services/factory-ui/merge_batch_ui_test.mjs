@@ -71,13 +71,13 @@ test("the tiles read Merge and Batch, with what they do as their second line", (
   assert.equal(nodeSubtitle({ service: "batch" }), "Collects", "a batch without a size names none");
   assert.equal(isNode({ service: "merge" }) && isNode({ service: "batch" }), true);
   assert.equal(isNode({ service: "agent" }) || isNode(undefined), false);
-  assert.match(workflows, /merge: "Merge", batch: "Batch" \}/);
-  assert.match(workflows, /const KIND_ICON = \{ team: TEAM_ICON, merge: MERGE_ICON, batch: BATCH_ICON \}/);
+  assert.match(workflows, /merge: "Merge", batch: "Batch", /);
+  assert.match(workflows, /const KIND_ICON = \{ team: TEAM_ICON, merge: MERGE_ICON, batch: BATCH_ICON, /);
   assert.match(workflows, /case "merge": case "batch": return L\.nodeSubtitle\(s\);/);
 });
 
 test("the kinds are offered where a step's kind is chosen: the Service suggestions and the canvas menu", () => {
-  assert.match(workflows, /for \(const value of \["workflow", "team", \.\.\.L\.NODE_KINDS\]\)/);
+  assert.match(workflows, /for \(const value of \["workflow", "team", \.\.\.L\.NODE_KINDS, \.\.\.L\.POD_KINDS\]\)/);
   assert.match(workflows, /\["Add merge", \(\) => addStep\("merge"\), "", "[^"]+"\]/);
   assert.match(workflows, /\["Add batch", \(\) => addStep\("batch"\), "", "[^"]+"\]/);
   assert.match(workflows, /merge waits for a result from every source and forwards them together; batch collects results/);
@@ -171,12 +171,12 @@ test("no page reads step inputs as a map", () => {
 
 test("the pass of a step is read from its name, also through workflow nodes", () => {
   const { stepPass } = runsLogic();
-  assert.deepEqual(plain(stepPass("compare.pass-2")), { step: "compare", pass: 2 });
-  assert.deepEqual(plain(stepPass("compare")), { step: "compare", pass: 0 });
-  assert.deepEqual(plain(stepPass("build/compare.pass-12")), { step: "build/compare", pass: 12 });
-  assert.deepEqual(plain(stepPass("build.pass-3/write")), { step: "build/write", pass: 3 });
-  assert.deepEqual(plain(stepPass("review.1")), { step: "review.1", pass: 0 }, "a gate round is not a pass");
-  assert.deepEqual(plain(stepPass("compare.pass-0")), { step: "compare.pass-0", pass: 0 }, "passes start at 1");
+  assert.deepEqual(plain(stepPass("compare.pass-2")), { step: "compare", pass: 2, round: 0 });
+  assert.deepEqual(plain(stepPass("compare")), { step: "compare", pass: 0, round: 0 });
+  assert.deepEqual(plain(stepPass("build/compare.pass-12")), { step: "build/compare", pass: 12, round: 0 });
+  assert.deepEqual(plain(stepPass("build.pass-3/write")), { step: "build/write", pass: 3, round: 0 });
+  assert.deepEqual(plain(stepPass("review.1")), { step: "review.1", pass: 0, round: 0 }, "a gate round is not a pass");
+  assert.deepEqual(plain(stepPass("compare.pass-0")), { step: "compare.pass-0", pass: 0, round: 0 }, "passes start at 1");
 });
 
 // The shapes below are what the orchestrator answers: "nodes" keyed by step ID.
@@ -271,7 +271,7 @@ test("the gate, session and team of a pass are found under <step>.pass-<n>", () 
   vm.runInNewContext(`${read("workflowref.js")}\n${read("teams.js").slice(0, read("teams.js").indexOf("// ---- Running teams"))}\nglobalThis.out = TeamsLogic;`, teams);
   const round = teams.out.roundOf("runs/t/review.pass-1.2");
   assert.deepEqual(plain(round), { artifact: "runs/t/review.pass-1", round: 2 });
-  assert.deepEqual(plain(stepPass(round.artifact)), { step: "runs/t/review", pass: 1 });
+  assert.deepEqual(plain(stepPass(round.artifact)), { step: "runs/t/review", pass: 1, round: 0 });
   assert.equal(teams.out.validTeam("teams/t/build.pass-2"), true);
   assert.match(runs, /const gate = decisionsState\.pending\.find\(\(d\) => d\.trace_id === trace && d\.artifact === `runs\/\$\{trace\}\/\$\{key\}`\);/);
   assert.match(runs, /const session = `user-sessions\/\$\{trace\}\/\$\{key\}`, team = `teams\/\$\{trace\}\/\$\{key\}`;/);

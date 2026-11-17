@@ -181,6 +181,11 @@ const ChatLogic = (() => {
   const jsonProblem = (text) => prettyJSON(text).error;
 
   // A session opens at #sessions/<trace>/<step>: its blobstore path without user-sessions/.
+  // devPodOf reads the dev pod of a session entry of GET /api/orchestrator/sessions: "dev_pod" is
+  // the pod's ID, or an object with its "id"; "" when the run has no pod. The chat request sends
+  // it on as "dev_pod".
+  const devPodOf = (entry) => { const pod = entry?.dev_pod; return typeof pod === "string" ? pod : pod && typeof pod.id === "string" ? pod.id : ""; };
+
   const sessionHash = (session) => `#sessions/${String(session).replace(/^user-sessions\//, "")}`;
   function sessionFromHash(rest) {
     const path = String(rest || "").split("?")[0].replace(/^\/+|\/+$/g, "");
@@ -189,7 +194,7 @@ const ChatLogic = (() => {
 
   return {
     MAX_UPLOAD_BYTES, PIPE_MARK, validTabId, validFileName, validSession, agentName, newTabId, tabLabels, fileKind, storedFileName,
-    uploadProblem, findMatches, stepMatch, contentText, conversation, mermaidBlocks, maskTablePipes, unmaskPipes, UNDERSCORE_MARK, maskWordUnderscores, unmaskUnderscores, codeFile, prettyJSON, jsonProblem, sessionHash, sessionFromHash,
+    uploadProblem, findMatches, stepMatch, contentText, conversation, mermaidBlocks, maskTablePipes, unmaskPipes, UNDERSCORE_MARK, maskWordUnderscores, unmaskUnderscores, codeFile, prettyJSON, jsonProblem, sessionHash, sessionFromHash, devPodOf,
   };
 })();
 
@@ -539,6 +544,7 @@ const InteractiveSession = (() => {
       try {
         reply = await api("POST", "/api/agent/chat", {
           trace_id: o.traceId, step_id: o.step, session, tab: t.id, agent: t.agent, message: text, created_by: creator(),
+          ...(o.devPod ? { dev_pod: o.devPod } : {}), // the run's dev pod, so the agent's tools reach it
         });
       } catch (e) { failure = e.message; }
       // The stored log is the truth, also after a failure: the view shows what the agent kept.
@@ -611,6 +617,7 @@ const InteractiveSession = (() => {
         });
         li.addEventListener("contextmenu", (ev) => openMenu(ev, [
           ["Open", () => openFile(f.name), "", "Opens the file in a tab"],
+          ["Download", () => downloadBlob(fileId(f.name), f.name), "", "Saves the file on this computer under its name"],
           ...(locked() ? [] : ["-", ["Delete", () => deleteFile(f.name), "danger", "Deletes the file from the session"]]),
         ]));
         return li;
@@ -673,6 +680,8 @@ const InteractiveSession = (() => {
         t.count = h("span", { className: "viewer-count", role: "status" });
         t.prev = iconButton("up", "Previous match", () => stepSearch(t, -1));
         t.next = iconButton("down", "Next match", () => stepSearch(t, 1));
+        // Download saves the stored file under its name; an HTML file is saved, never rendered here.
+        t.download = iconButton("download", "Download file", () => downloadBlob(fileId(t.name), t.name));
         t.edit = iconButton("edit", "Edit file", () => startEdit(t));
         t.cancel = h("button", { type: "button", onclick: () => cancelEdit(t) }, "Cancel");
         t.save = h("button", { type: "button", onclick: () => saveFile(t) }, "Save");
@@ -680,7 +689,7 @@ const InteractiveSession = (() => {
         t.body = h("div", { className: "viewer-body" });
         t.area = h("textarea", { className: "viewer-editor", hidden: true, spellcheck: false, autocomplete: "off", "aria-label": `Text of ${name}` });
         t.pane = h("div", { className: "chat-pane viewer-pane", role: "tabpanel", hidden: true },
-          h("div", { className: "viewer-bar" }, t.search, t.count, t.prev, t.next, h("span", { className: "viewer-actions" }, t.edit, t.cancel, t.save)),
+          h("div", { className: "viewer-bar" }, t.search, t.count, t.prev, t.next, h("span", { className: "viewer-actions" }, t.download, t.edit, t.cancel, t.save)),
           t.problem, t.body, t.area);
         t.search.addEventListener("input", () => applySearch(t));
         t.search.addEventListener("keydown", (ev) => {

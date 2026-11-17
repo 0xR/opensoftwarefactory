@@ -253,13 +253,13 @@ test("nothing is saved automatically: Save posts a new version, and the page cod
   for (const hidden of ["MEMBER_H", "ONE_WAY", "RESERVED_MEMBER"]) assert.doesNotMatch(page, new RegExp(`(?<![.\\w])${hidden}\\b`), hidden);
 });
 
-test("a gate can return rejections only to team steps it depends on", () => {
+test("a gate can return rejections to the team and agent steps it depends on, never to others", () => {
   const { rejectTargets } = logic();
   const w = { name: "tb", steps: [
-    { id: "team", service: "team" }, { id: "other-team", service: "team" }, { id: "agent", service: "agent" },
+    { id: "team", service: "team" }, { id: "other-team", service: "team" }, { id: "agent", service: "agent" }, { id: "router", service: "route" },
     { id: "review", service: "gate", depends_on: ["agent", "team", "gone"] },
   ] };
-  assert.deepEqual(plain(rejectTargets(w, w.steps[3])), ["team"]);
+  assert.deepEqual(plain(rejectTargets(w, w.steps[4])), ["agent", "team"], "a team as before, and now an agent step too");
   assert.deepEqual(plain(rejectTargets(w, { id: "g", service: "gate" })), []);
 });
 
@@ -326,8 +326,8 @@ test("member tiles sit on a ring with the lead at the top and never overlap", ()
 // ---- The page uses the logic and its styles exist ----
 
 test("the editor knows the workflow and team kinds and keeps their fields when a step is duplicated", () => {
-  assert.match(source, /const SPECIAL = \["agent", "gate", "interactive", "route", "workflow", "team", "merge", "batch"\]/);
-  assert.match(source, /"max_attempts", "workflow", "workflows", "channels", "max_turns", "member_positions", "capacity", "size", "input_timeout"\]/);
+  assert.match(source, /const SPECIAL = \["agent", "gate", "interactive", "route", "workflow", "team", "merge", "batch", \.\.\.L\.POD_KINDS\]/);
+  assert.match(source, /"max_attempts", "workflow", "workflows", "channels", "max_turns", "member_positions", "capacity", "size", "input_timeout",/);
   assert.match(source, /addEventListener\("dblclick"/);
   for (const field of ["workflow", "workflow_version", "on_reject", "max_turns", "lead"]) assert.match(source, new RegExp(`\\n    ${field}\\(s, v\\)`), field);
 });

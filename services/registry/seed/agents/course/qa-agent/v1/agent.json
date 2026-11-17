@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
   "name": "course/qa-agent",
-  "description": "Session 8: goes through the test claims of a pull request the way a customer would and reports what each one shows.",
+  "description": "Session 8: uses the claim status panel like a customer in a dev pod and reports what it sees.",
   "unpack_inputs": true,
   "models": ["qwen3.5-9b-mlx"],
   "effort": "none",
-  "tools": [],
-  "max_retries": 0
+  "tools": ["devpod/read_file", "devpod/run_command"],
+  "commands": ["./panel.sh *"],
+  "max_retries": 12
 }

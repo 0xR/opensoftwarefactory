@@ -33,7 +33,7 @@ func newTestUI(t *testing.T) (*httptest.Server, chan seen) {
 	t.Helper()
 	got := make(chan seen, 1)
 	b := fakeBackend(t, got)
-	h, err := newHandler(backends{orchestrator: b.URL, agents: b.URL, policies: b.URL, blobs: b.URL, llm: b.URL, mcp: b.URL, evaluations: b.URL, agent: b.URL}, slog.New(slog.DiscardHandler))
+	h, err := newHandler(backends{orchestrator: b.URL, agents: b.URL, policies: b.URL, blobs: b.URL, llm: b.URL, mcp: b.URL, evaluations: b.URL, connectors: b.URL, agent: b.URL}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,6 +59,10 @@ func TestProxyRewritesPaths(t *testing.T) {
 		{"GET", "/api/policies/policies", "/policies", ""},
 		{"GET", "/api/evaluations/runs", "/api/runs", ""},
 		{"POST", "/api/evaluations/sets", "/api/sets", `{"name":"baseline","run_ids":["abc"]}`},
+		{"GET", "/api/connectors/git/repositories", "/api/git/repositories", ""},
+		{"PUT", "/api/connectors/git/repositories/claims-build", "/api/git/repositories/claims-build", `{"kind":"plain","url":"http://git-host:8080/claims-build.git"}`},
+		{"DELETE", "/api/connectors/devpods/abc", "/api/devpods/abc", ""},
+		{"POST", "/api/connectors/devpods/abc/publish-requests/1/decision", "/api/devpods/abc/publish-requests/1/decision", `{"decision":"approve"}`},
 		{"POST", "/api/policies/policies/security", "/policies/security", `{"files":{}}`},
 		{"GET", "/api/blobs/list/", "/list/", ""},
 		{"GET", "/api/blobs/list/agents", "/list/agents", ""},

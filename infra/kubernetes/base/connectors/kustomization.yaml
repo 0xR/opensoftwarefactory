@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The Role and RoleBinding of the connector service are in devpods/, because they belong to
+# the dev pod namespace; the overlay includes them next to the factory's namespace.
+resources:
+  - serviceaccount.yaml
+  - deployment.yaml
+  - service.yaml

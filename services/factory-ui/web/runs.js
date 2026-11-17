@@ -121,8 +121,60 @@ const RunsLogic = (() => {
   // stepLabel names a step for the page: its path in title case, and its pass when it has one
   // ("compare.pass-2" is "Compare · pass 2").
   function stepLabel(key, title = (id) => id) {
-    const { step, pass } = stepPass(key);
-    return `${step.split("/").map(title).join(" / ")}${pass ? ` · pass ${pass}` : ""}`;
+    const { step, pass, round } = stepPass(key);
+    return `${step.split("/").map(title).join(" / ")}${pass ? ` · pass ${pass}` : ""}${round ? ` · round ${round}` : ""}`;
+  }
+
+  // roundRows lists the rounds of a step that ran again after a rejection, oldest first: the
+  // kept ones ([{ round, artifact, record }], stored as <step>.round-<n>) and the newest, whose
+  // result has the step's own name (current). count is how often the run status says the step
+  // ran; 0 when it does not say. A step that ran once has no rows.
+  function roundRows(kept, count = 0) {
+    const rows = (kept || []).map((r) => ({ round: r.round, artifact: r.artifact || "", current: false }));
+    if (!rows.length) return [];
+    rows.push({ round: Math.max(rows[rows.length - 1].round + 1, Math.floor(Number(count)) || 0), artifact: "", current: true });
+    return rows;
+  }
+
+  // pullRequest is the one place that reads a pull request record, runs/<run>/pull-request.json:
+  //   { repository, source_branch, work_branch, title, body, commits: [{ hash, subject, author }],
+  //     patch: "<object ID of the patch>", pushed, url }
+  // url is there only for a pull request opened on GitHub. Returns null for anything else.
+  function pullRequest(text) {
+    let raw;
+    try { raw = JSON.parse(text); } catch { return null; }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const word = (value) => (typeof value === "string" ? value : "");
+    return {
+      repository: word(raw.repository), sourceBranch: word(raw.source_branch), workBranch: word(raw.work_branch),
+      title: word(raw.title), body: word(raw.body),
+      commits: (Array.isArray(raw.commits) ? raw.commits : []).filter((c) => c && typeof c === "object")
+        .map((c) => ({ hash: word(c.hash), subject: word(c.subject), author: word(c.author) })),
+      patch: word(raw.patch), pushed: raw.pushed === true, url: /^https?:\/\//.test(word(raw.url)) ? raw.url : "",
+    };
+  }
+
+  // stepDocument reads the output document of a dev pod, command or stop step and says what
+  // the step did: lines of text and, for a command, the command and its output.
+  //   devpod:      { pod, repository, source_branch, work_branch, start_commit, reused }
+  //   command:     { command, exit_code, stdout, stderr }
+  //   devpod-stop: { pod, stopped }
+  // Returns null for another kind of step or a document that is not such JSON.
+  function stepDocument(service, text) {
+    let raw;
+    try { raw = JSON.parse(text); } catch { return null; }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const word = (value) => (typeof value === "string" ? value : "");
+    if (service === "devpod") {
+      const from = [word(raw.source_branch) ? `From ${raw.source_branch}` : "", word(raw.start_commit) ? `at ${raw.start_commit.slice(0, 8)}` : ""].filter(Boolean).join(" ");
+      return { lines: [[word(raw.repository), word(raw.work_branch)].filter(Boolean).join(" · "), [from, raw.reused === true ? "continued in the live dev pod" : ""].filter(Boolean).join(", ")].filter(Boolean), command: "", output: "" };
+    }
+    if (service === "command") {
+      const output = [word(raw.stdout), word(raw.stderr)].filter((part) => part.trim()).join(word(raw.stdout).endsWith("\n") ? "" : "\n");
+      return { lines: [Number.isInteger(raw.exit_code) ? `Exit code ${raw.exit_code}` : ""].filter(Boolean), command: word(raw.command), output };
+    }
+    if (service === "devpod-stop") return { lines: [raw.stopped === false ? "Dev pod not deleted" : "Dev pod deleted"], command: "", output: "" };
+    return null;
   }
 
   // recordKey is the key of a step's execution record: the step itself, or its newest pass.
@@ -143,7 +195,7 @@ const RunsLogic = (() => {
     return found.size ? [...found].sort((x, y) => x - y).map((pass) => ({ team: `${base}.pass-${pass}`, pass })) : [{ team: base, pass: 0 }];
   }
 
-  return { isNode, nodeView, countdown, nodeLines, nodeState, forwardedBy, passSource, passRows, stepLabel, recordKey, teamPaths };
+  return { isNode, nodeView, countdown, nodeLines, nodeState, forwardedBy, passSource, passRows, stepLabel, recordKey, teamPaths, roundRows, pullRequest, stepDocument };
 })();
 
 (() => {
@@ -327,7 +379,77 @@ const RunsLogic = (() => {
   function runChip(trace, st) {
     const waiting = isWaiting(trace);
     if (st?.gone) return statusChip("idle", "Unknown", "Temporal has no history of this run; only its artifacts remain");
-    return st && st.status ? statusChip(runState(st.status, waiting), runStateWord(st.status, waiting)) : statusChip("idle", "…");
+    // A blocked run gives the agent's reason as the chip's tooltip.
+    return st && st.status ? statusChip(runState(st.status, waiting), runStateWord(st.status, waiting), st.blocked || "") : statusChip("idle", "…");
+  }
+
+  // stored reads a small JSON document of a run (a step's output, the pull request record),
+  // once for a finished run and again every 10 s while the run goes on. "" when it cannot be read.
+  const storedDocs = new Map(); // object ID -> { text, at, final }
+  async function stored(id, final) {
+    const cached = storedDocs.get(id);
+    if (cached && (cached.final || Date.now() - cached.at < 10000)) return cached.text;
+    let text = "";
+    try { text = (await loadBlob(id)).text; } catch { return cached?.text || ""; }
+    storedDocs.set(id, { text, at: Date.now(), final });
+    return text;
+  }
+
+  // livePods lists the IDs of the dev pods that exist now, asked at most every 10 s; null
+  // while the connector service does not answer.
+  let podIds = null, podIdsAt = 0;
+  async function livePods() {
+    if (Date.now() - podIdsAt > 10000) {
+      podIdsAt = Date.now();
+      try { podIds = new Set(ConnectorsLogic.devPods(await api("GET", "/api/connectors/devpods")).map((p) => p.id)); } catch { podIds = null; }
+    }
+    return podIds;
+  }
+
+  // podSection shows the run's dev pod: its repository and work branch, and View files, which
+  // opens the read-only view of the pod. A pod that is gone is said to be gone.
+  function podSection(pod, live) {
+    if (!pod) return null;
+    const name = [pod.repository, pod.workBranch].filter(Boolean).join(" · ");
+    const gone = live && !live.has(pod.id);
+    return h("div", { className: "section" },
+      h("h3", { className: "section-title" }, "Dev pod"),
+      h("div", { className: "run-pod" },
+        h("span", { className: "run-pod-name", dataset: { full: name } }, name),
+        gone ? h("span", { className: "muted" }, "No longer exists")
+          : h("a", { className: "step-output step-action", href: ConnectorsLogic.podHash(pod.id), title: "Opens the pod's files, its commit log and its diff against the source branch" }, "View files")));
+  }
+
+  // pullRequestSection shows the pull request record of the run: its title, its branch, its
+  // commits, and the patch as a download.
+  function pullRequestSection(record, id) {
+    if (!record) return null;
+    const branch = [record.workBranch && record.sourceBranch ? `${record.workBranch} into ${record.sourceBranch}` : record.workBranch, record.repository, record.pushed ? "pushed" : "not pushed"].filter(Boolean);
+    const file = `${(record.workBranch || "pull-request").replace(/[^A-Za-z0-9._-]+/g, "-")}.patch`;
+    return h("div", { className: "section" },
+      h("div", { className: "file-head" }, h("h3", { className: "section-title" }, "Pull request"),
+        h("a", { href: memoryObjectHash(id), title: "Opens the pull request record in Memory" }, "View record"),
+        record.url ? h("a", { href: record.url, target: "_blank", rel: "noopener" }, "Open on GitHub") : null,
+        record.patch && validBlobID(record.patch) ? h("a", { className: "step-action", href: `/api/blobs/blobs/${record.patch}`, download: file, title: "Downloads the commits as a patch that git am applies" }, "Download patch") : null),
+      h("p", { className: "pull-request-title" }, record.title || "Untitled"),
+      h("p", { className: "step-doc-line" }, branch.join(" · ")),
+      record.commits.length ? h("ul", { className: "pull-request-commits" }, ...record.commits.map((c) => h("li", {},
+        h("span", { className: "mono", title: c.hash }, c.hash.slice(0, 8)),
+        h("span", { className: "subject", dataset: { full: c.subject } }, c.subject),
+        h("span", { className: "author" }, c.author)))) : null);
+  }
+
+  // stepDoc shows what a dev pod, command or stop step did, under its name: a command step its
+  // command, its exit code and, folded, its output.
+  const openOutputs = new Set(); // the outputs unfolded by hand, so a redraw keeps them open
+  function stepDoc(doc, key) {
+    if (!doc) return null;
+    const output = doc.output ? h("details", { open: openOutputs.has(key) }, h("summary", {}, "Output"), h("pre", { className: "file-block code source" }, doc.output)) : null;
+    output?.addEventListener("toggle", () => { if (output.open) openOutputs.add(key); else openOutputs.delete(key); });
+    return h("span", { className: "step-doc" },
+      doc.command ? h("span", { className: "step-doc-line mono" }, doc.command) : null,
+      ...doc.lines.map((line) => h("span", { className: "step-doc-line" }, line)),
+      output);
   }
 
   // rootError reduces a Temporal error chain to its innermost message, in the page's words: a step
@@ -620,7 +742,8 @@ const RunsLogic = (() => {
     const def = TeamsLogic.defOf(defs, root);
     const artifacts = st.artifacts || {};
     // A failed run names the step it failed at; a merge that timed out or ran full names itself.
-    const failedStep = st.status && st.status !== "Running" && st.status !== "Completed" ? /(?:step|merge|batch) "([^"]+)"/.exec(st.error || "")?.[1] : "";
+    // A blocked run did not fail: its error is the reason the agent gave.
+    const failedStep = st.status && !["Running", "Completed", "Blocked"].includes(st.status) ? /(?:step|merge|batch) "([^"]+)"/.exec(st.error || "")?.[1] : "";
     // The steps that ran, in order; then the failed one; while running, the rest of the definition.
     const stepIds = [...(st.order || [])];
     if (failedStep && !stepIds.includes(failedStep)) stepIds.push(failedStep);
@@ -637,7 +760,9 @@ const RunsLogic = (() => {
     const failedNested = new Set(failedStep ? TeamsLogic.failedPaths(st.error) : []);
     // A gate waits at the step whose output it will write; a nested session at its own path.
     // A gate that runs in passes waits at the output of its pass, <step>.pass-<n>.
-    const waitingGateOf = (id) => decisionsState.pending.find((d) => d.trace_id === trace && (d.artifact ? stepPass(d.artifact).step === `runs/${trace}/${id}` : d.step === id));
+    // A publish decision (<step>.publish-<n>) waits at the step whose agent asked to publish.
+    const waitingGateOf = (id) => decisionsState.pending.find((d) => d.trace_id === trace && (publishStep(d.step) === id || (d.artifact ? stepPass(d.artifact).step === `runs/${trace}/${id}` : d.step === id)));
+    const waitingPublish = (id) => decisionsState.pending.some((d) => d.trace_id === trace && publishStep(d.step) === id);
     // A merge or batch step shows what it holds; the steps after it run once per message it
     // forwards, and show one entry per pass.
     const pathOf = (id, other) => id.slice(0, id.lastIndexOf("/") + 1) + other; // a step beside id, in the same workflow
@@ -673,6 +798,7 @@ const RunsLogic = (() => {
     const stepState = (id) => {
       const child = id.includes("/"), parent = id.slice(0, id.lastIndexOf("/") + 1);
       if (st.status === "Running" && teamRunning(teamOf(id))) return "running"; // also in a later round, when its earlier result exists
+      if (st.status === "Running" && waitingPublish(id)) return "waiting"; // its result exists; a person decides whether it is published
       if (RunsLogic.isNode(definedStep(id))) return (child ? failedNested.has(id) : id === failedStep) ? "failed" : RunsLogic.nodeState(nodeOf(id), st.status);
       const passStates = passEntries(id).map((p) => p.state); // of a later pass too, when its earlier output exists
       for (const found of ["waiting", "running", "failed"]) if (passStates.includes(found)) return found;
@@ -690,17 +816,26 @@ const RunsLogic = (() => {
       }
       return "idle";
     };
-    const [agents, records, known, telemetry, sessions] = await Promise.all([
+    const final = st.status !== "Running";
+    const [agents, records, known, telemetry, sessions, docs, live, pullText] = await Promise.all([
       Promise.all(rows.map(({ id }) => agentOf(trace, st, def, id, id.includes("/") ? definedStep(id) : null))),
       Promise.all([...(st.records || [])].map(async (step) => ({ step, attempts: await executionRecords(trace, st, step) }))),
       existingAgents(),
       telemetryWarning(),
       sessionFolders(trace, st, def),
+      // A dev pod, command or stop step shows its output document under its name.
+      Promise.all(rows.map(async ({ id }) => {
+        const service = definedStep(id)?.service;
+        return ["devpod", "command", "devpod-stop"].includes(service) && artifactOf(id) ? RunsLogic.stepDocument(service, await stored(artifactOf(id), final)) : null;
+      })),
+      st.devPod ? livePods() : null,
+      st.pullRequest && validBlobID(st.pullRequest) ? stored(st.pullRequest, final) : "",
     ]);
     if (state.selected !== trace) return;
     const pending = decisionsState.pending.filter((d) => d.trace_id === trace);
-    // The output of each pass, by its record key ("compare.pass-2"), for the execution evidence.
-    const passArtifacts = Object.fromEntries(Object.values(st.passes || {}).flat().filter((p) => p.record && p.artifact).map((p) => [p.record, p.artifact]));
+    // The output of each pass and of each kept round, by its record key ("compare.pass-2",
+    // "build.round-1"), for the execution evidence.
+    const passArtifacts = Object.fromEntries([...Object.values(st.passes || {}), ...Object.values(st.rounds || {})].flat().filter((p) => p.record && p.artifact).map((p) => [p.record, p.artifact]));
     const now = Date.now();
     const gates = new Set((def?.steps || []).filter((s) => s.service === "gate").map((s) => s.id));
     detail.replaceChildren(
@@ -712,8 +847,12 @@ const RunsLogic = (() => {
             r ? [h("span", { className: "sep" }, "·"), timeEl(r.started)] : null,
             version ? [h("span", { className: "sep" }, "·"), h("span", { className: "run-version" }, `Workflow v${version}`)] : null,
             h("span", { className: "sep" }, "·"), h("span", { className: "meta-pair" }, h("a", { href: `#artifacts?trace=${encodeURIComponent(trace)}` }, "View trace"), copyButton(trace, "trace ID")))),
-        st.error && st.status !== "Running" && !st.gone ? h("div", { className: "section" },
-          h("p", { className: "error-line", title: st.error }, rootError(st.error, trace))) : null,
+        // A blocked run says why in the agent's words, as text: nothing failed.
+        st.status === "Blocked" ? (st.blocked ? h("div", { className: "section" }, h("p", { className: "blocked-line" }, st.blocked)) : null)
+          : st.error && st.status !== "Running" && !st.gone ? h("div", { className: "section" },
+            h("p", { className: "error-line", title: st.error }, rootError(st.error, trace))) : null,
+        podSection(st.devPod, live),
+        pullRequestSection(pullText ? RunsLogic.pullRequest(pullText) : null, st.pullRequest),
         telemetry,
         executionTimeline(records, { trace, runStatus: st.status, runError: st.error, inputArtifact: r?.input_artifact, artifacts, passArtifacts, retentionDays: observabilityHealth?.retention_days || 0 }),
         h("div", { className: "section" },
@@ -751,7 +890,11 @@ const RunsLogic = (() => {
             const notes = RunsLogic.nodeLines(nodeOf(id), now, titleCase);
             const ref = agents[i];
             const [name, version] = ref.split("@");
-            const link = stepLink(id);
+            // A step that ran again after a rejection has one entry per round under it; the
+            // newest round carries the step's own link.
+            const rounds = passes.length ? [] : RunsLogic.roundRows(st.rounds?.[id], st.roundCounts?.[id]);
+            const ownLink = stepLink(id);
+            const link = rounds.length ? null : ownLink;
             // A step without an agent or a link gives its name those columns (see .step-list).
             // A nested step is indented under its workflow node and named by its own ID.
             const row = h("li", { className: [ref ? "" : "no-agent", link ? "" : "no-link", depth ? "step-child" : ""].join(" ").trim(), style: depth ? `--step-depth:${depth}` : undefined }, statusChip(stepState(id)),
@@ -760,12 +903,19 @@ const RunsLogic = (() => {
               !ref ? null : known.has(ref) ? h("a", { className: "step-agent", href: `#agents/${name}/${version}`, title: "Opens the agent in Agents" }, ref) : h("span", { className: "step-agent" }, ref),
               link,
               // A merge or batch step says what it holds, under its name.
-              notes.length ? h("span", { className: "step-notes" }, ...notes.map((line) => h("span", { className: "step-note" }, line))) : null);
+              notes.length ? h("span", { className: "step-notes" }, ...notes.map((line) => h("span", { className: "step-note" }, line))) : null,
+              stepDoc(docs[i], `${trace}/${id}`));
             // A step after a merge or batch has one entry per pass, indented under it.
             return [row, ...passes.map((p) => {
               const link = passLink(p);
               return h("li", { className: `no-agent step-child step-pass${link ? "" : " no-link"}`, style: `--step-depth:${depth + 1}` }, statusChip(p.state),
                 h("span", { className: "step-name" }, `Pass ${p.pass}`), link);
+            }), ...rounds.map((r) => {
+              // An earlier round links to what it left, kept as <step>.round-<n>.
+              const link = r.current ? ownLink
+                : r.artifact ? h("a", { className: "step-output", href: `#artifacts?trace=${encodeURIComponent(trace)}&object=${encodeURIComponent(r.artifact)}` }, "View output") : null;
+              return h("li", { className: `no-agent step-child step-pass step-round${link ? "" : " no-link"}`, style: `--step-depth:${depth + 1}` }, statusChip(r.current ? stepState(id) : "done"),
+                h("span", { className: "step-name" }, `Round ${r.round}`), link);
             })];
           })))));
   }

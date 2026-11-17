@@ -28,7 +28,7 @@ func TestStepRequestReadsTheItemList(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &req); err != nil {
 		t.Fatal(err)
 	}
-	want := []InputItem{{"short", "runs/t1/short", 1}, {"a", "runs/t1/a.pass-2", 2}}
+	want := []InputItem{{Source: "short", Artifact: "runs/t1/short", Round: 1}, {Source: "a", Artifact: "runs/t1/a.pass-2", Round: 2}}
 	if len(req.Inputs) != 2 || req.Inputs[0] != want[0] || req.Inputs[1] != want[1] {
 		t.Fatalf("inputs = %+v", req.Inputs)
 	}
@@ -42,7 +42,7 @@ func TestFirstMessageUnpacksInputsInListOrder(t *testing.T) {
 	f := newFakes(t, `{"schema_version":1,"name":"intake","unpack_inputs":true,"models":["m1"]}`, respond(finalResponse))
 	req := request()
 	// The list order is kept: "intake" comes before "input".
-	req.Inputs = []InputItem{{"intake", "runs/t1/intake", 1}, {"input", "runs/t1/input", 1}}
+	req.Inputs = []InputItem{{Source: "intake", Artifact: "runs/t1/intake", Round: 1}, {Source: "input", Artifact: "runs/t1/input", Round: 1}}
 	if _, err := f.svc.Process(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestFirstMessageWritesTheRoundOnlyForARepeatedSource(t *testing.T) {
 	f.blobs["runs/t1/a.pass-1"] = []byte("first a")
 	f.blobs["runs/t1/a.pass-2"] = []byte("second a")
 	req := request()
-	req.Inputs = []InputItem{{"a", "runs/t1/a.pass-1", 1}, {"input", "runs/t1/input", 1}, {"a", "runs/t1/a.pass-2", 2}}
+	req.Inputs = []InputItem{{Source: "a", Artifact: "runs/t1/a.pass-1", Round: 1}, {Source: "input", Artifact: "runs/t1/input", Round: 1}, {Source: "a", Artifact: "runs/t1/a.pass-2", Round: 2}}
 	if _, err := f.svc.Process(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestFirstMessageListsReferencesWithoutUnpacking(t *testing.T) {
 	f := newFakes(t, `{"schema_version":1,"name":"intake","unpack_inputs":false,"models":["m1"]}`, respond(finalResponse))
 	req := request()
 	// The artifacts are not read, so they do not have to exist.
-	req.Inputs = []InputItem{{"short", "merge-demo/short", 1}, {"long-b", "merge-demo/long-b", 1}}
+	req.Inputs = []InputItem{{Source: "short", Artifact: "merge-demo/short", Round: 1}, {Source: "long-b", Artifact: "merge-demo/long-b", Round: 1}}
 	if _, err := f.svc.Process(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}

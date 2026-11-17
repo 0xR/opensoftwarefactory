@@ -24,7 +24,11 @@ const maxBodyBytes = 64 << 20
 
 // RunStatus describes one pipeline run. Nodes is the state of its merge and batch steps: a
 // pipeline.MergeState or pipeline.BatchState per step ID. It is left out for a run without
-// such steps.
+// such steps. Status is "Blocked", with the reason in Error, for a run an agent ended with
+// report_blocked. DevPod is the run's dev pod and PullRequest the object ID of the pull
+// request record the connector service stored for the run, when they exist. Rounds counts
+// the runs of every step that ran again after a rejection; the results of the earlier runs
+// are stored as <step>.round-<n>.
 type RunStatus struct {
 	TraceID       string            `json:"trace_id"`
 	Workflow      string            `json:"workflow,omitempty"`
@@ -36,6 +40,9 @@ type RunStatus struct {
 	Artifacts     map[string]string `json:"artifacts,omitempty"`
 	Nodes         json.RawMessage   `json:"nodes,omitempty"`
 	Error         string            `json:"error,omitempty"`
+	DevPod        *pipeline.DevPod  `json:"dev_pod,omitempty"`
+	PullRequest   string            `json:"pull_request,omitempty"`
+	Rounds        map[string]int    `json:"rounds,omitempty"`
 }
 
 // RunRecord is stored as runs/<trace>/run.json when a run starts.
@@ -242,6 +249,7 @@ func (s *server) getRun(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, errRunNotFound) {
 		// The run history is kept only for a while; a finished run is then answered from its metadata.
 		if stored, ok := s.storedStatus(r.Context(), trace); ok {
+			s.addPod(r.Context(), &stored)
 			writeJSON(w, http.StatusOK, stored)
 			return
 		}
@@ -252,7 +260,26 @@ func (s *server) getRun(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusBadGateway, err)
 		return
 	}
+	s.addPod(r.Context(), &st)
 	writeJSON(w, http.StatusOK, st)
+}
+
+// addPod adds the run's dev pod, which the metadata records, and the object ID of its pull
+// request record, when the connector service stored one.
+func (s *server) addPod(ctx context.Context, st *RunStatus) {
+	prefix := pipeline.RunPrefix(st.TraceID)
+	if data, err := s.blobs.Get(ctx, pipeline.ArtifactID(prefix, pipeline.MetadataFile)); err == nil {
+		var meta struct {
+			DevPod *pipeline.DevPod `json:"dev_pod"`
+		}
+		if json.Unmarshal(data, &meta) == nil && meta.DevPod != nil && meta.DevPod.ID != "" {
+			st.DevPod = meta.DevPod
+		}
+	}
+	record := pipeline.ArtifactID(prefix, pipeline.PullRequestFile)
+	if _, err := s.blobs.Get(ctx, record); err == nil {
+		st.PullRequest = record
+	}
 }
 
 // deleteRun removes a run: its history (a running run is terminated first) and every
@@ -345,7 +372,7 @@ func (s *server) postDecision(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusBadRequest, errors.New("decision must be approved or rejected"))
 		return
 	}
-	// A gate with on_reject sends the reason to its team, so a rejection needs one.
+	// A gate with on_reject sends the reason back to an earlier step, so a rejection needs one.
 	if req.Decision.Decision == pipeline.Rejected && strings.TrimSpace(req.Comment) == "" {
 		pending, err := s.runner.Pending(r.Context())
 		if err != nil {
@@ -354,7 +381,7 @@ func (s *server) postDecision(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, gate := range pending {
 			if gate.WorkflowID == req.WorkflowID && gate.Step == req.Step && gate.OnReject != "" {
-				s.fail(w, http.StatusBadRequest, errors.New("a rejection at this gate needs a comment with the reason; it is sent to the team"))
+				s.fail(w, http.StatusBadRequest, errors.New("a rejection at this gate needs a comment with the reason; it goes back to the step that runs again"))
 				return
 			}
 		}

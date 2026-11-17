@@ -387,8 +387,8 @@ func (r *registry) createVersion(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"name": name, "version": version})
 }
 
-// validateModelSettings checks the optional model setting of an agent.json:
-// "temperature" is a number from 0 to 2.
+// validateModelSettings checks the optional settings of an agent.json:
+// "temperature" is a number from 0 to 2, and "commands" is a list of non-empty strings.
 func validateModelSettings(agentJSON []byte) error {
 	var settings map[string]json.RawMessage
 	if err := json.Unmarshal(agentJSON, &settings); err != nil {
@@ -398,6 +398,17 @@ func validateModelSettings(agentJSON []byte) error {
 		var temperature *float64
 		if err := json.Unmarshal(raw, &temperature); err != nil || temperature == nil || *temperature < 0 || *temperature > 2 {
 			return fmt.Errorf("agent.json: temperature must be a number from 0 to 2, got %s", raw)
+		}
+	}
+	if raw, ok := settings["commands"]; ok {
+		var commands []string
+		if err := json.Unmarshal(raw, &commands); err != nil || commands == nil {
+			return fmt.Errorf("agent.json: commands must be a list of non-empty strings, got %s", raw)
+		}
+		for _, command := range commands {
+			if strings.TrimSpace(command) == "" {
+				return fmt.Errorf("agent.json: commands must be a list of non-empty strings, got %s", raw)
+			}
 		}
 	}
 	return nil

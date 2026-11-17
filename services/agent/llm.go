@@ -31,7 +31,9 @@ type chatRequest struct {
 	Tools           []any    `json:"tools,omitempty"`
 	ReasoningEffort string   `json:"reasoning_effort,omitempty"`
 	Temperature     *float64 `json:"temperature,omitempty"`
-	Stream          bool     `json:"stream"`
+	// MaxTokens limits one answer, so a model that does not stop cannot hold a step for minutes.
+	MaxTokens int  `json:"max_tokens,omitempty"`
+	Stream    bool `json:"stream"`
 }
 
 // completion is one parsed model response. Message is the assistant message

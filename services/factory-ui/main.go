@@ -41,6 +41,7 @@ var webFiles embed.FS
 // backends names the proxy targets.
 type backends struct {
 	orchestrator, agents, policies, blobs, llm, mcp, evaluations string
+	connectors                                                   string // the connector service: repositories and dev pods
 	agent                                                        string // the agent service, for interactive chat
 	cluster                                                      *clusterProxy
 	observability                                                *observabilityClient
@@ -65,6 +66,7 @@ func run() error {
 		llm:          env("LLM_GATEWAY_URL", "http://llm-gateway:8080"),
 		mcp:          env("MCP_GATEWAY_URL", "http://mcp-gateway:8080"),
 		evaluations:  env("EVALUATION_URL", "http://evaluation:8080"),
+		connectors:   env("CONNECTORS_URL", "http://connectors:8080"),
 		agent:        env("AGENT_URL", "http://agent:8080"),
 		cluster:      &clusterProxy{apiBase: inClusterAPI(), dir: serviceAccountDir, logger: logger},
 		observability: loadObservability(validateObservabilityURL(env("OBSERVABILITY_URL", "http://openobserve:5080")),
@@ -132,6 +134,13 @@ func newHandler(b backends, logger *slog.Logger) (http.Handler, error) {
 			return nil, err
 		}
 		mux.Handle("/api/evaluations/", p)
+	}
+	if b.connectors != "" {
+		p, err := newProxy("/api/connectors", b.connectors, "/api", logger)
+		if err != nil {
+			return nil, err
+		}
+		mux.Handle("/api/connectors/", p)
 	}
 	if b.mcp != "" {
 		p, err := newProxy("/api/mcp-gateway", b.mcp, "", logger)

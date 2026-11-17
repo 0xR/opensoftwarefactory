@@ -215,9 +215,133 @@ const WorkflowLogic = (() => {
     return draft || dirty ? "Needs the workflow saved first: a run uses a saved version" : "";
   }
 
-  // rejectTargets: the team steps a gate depends on, which a rejection can return to.
+  // ---- Rejections that go back (a gate's on_reject) ----
+  // A gate can send a rejection back to an earlier step: an agent, interactive, team or
+  // workflow step it depends on, directly or through other steps. That step runs again with
+  // the reason, and so do the steps between it and the gate.
+  const REJECT_KINDS = ["agent", "interactive", "team", "workflow"];
+  const KIND_WORD = { gate: "gate", route: "router", merge: "merge", batch: "batch", devpod: "dev pod", "devpod-stop": "stop dev pod", command: "command" };
+  const stepsById = (w) => new Map((w?.steps || []).map((s) => [s.id, s]));
+
+  // ancestors: the steps a step depends on, directly or through others, nearest first.
+  function ancestors(w, id) {
+    const byId = stepsById(w), seen = new Set([id]), found = [];
+    let level = byId.get(id)?.depends_on || [];
+    while (level.length) {
+      const next = [];
+      for (const dep of level) {
+        if (seen.has(dep) || !byId.has(dep)) continue;
+        seen.add(dep);
+        found.push(dep);
+        next.push(...(byId.get(dep).depends_on || []));
+      }
+      level = next;
+    }
+    return found;
+  }
+
+  // dependents: the step and every step that depends on it, directly or through others.
+  function dependents(w, id) {
+    const set = new Set([id]);
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const s of w?.steps || []) {
+        if (!set.has(s.id) && (s.depends_on || []).some((dep) => set.has(dep))) { set.add(s.id); changed = true; }
+      }
+    }
+    return set;
+  }
+
+  // rejectRefusal says why a gate cannot send its rejections back to a step, in one sentence,
+  // or "" when it can. It follows what the orchestrator refuses on Save. name turns a step ID
+  // into what the page shows.
+  function rejectRefusal(w, gate, targetId, name = (id) => id) {
+    const byId = stepsById(w), target = byId.get(targetId);
+    if (!target || targetId === gate.id) return "A rejection goes back to an earlier step";
+    if (!REJECT_KINDS.includes(target.service)) return `A rejection cannot go back to ${name(targetId)}, a ${KIND_WORD[target.service] || "service"} step`;
+    const before = new Set(ancestors(w, gate.id));
+    if (!before.has(targetId)) return `A rejection goes back to a step ${name(gate.id)} depends on, and it does not depend on ${name(targetId)}`;
+    const after = dependents(w, targetId);
+    // The target and the steps between it and the gate run again.
+    const again = (w?.steps || []).filter((s) => s.id !== gate.id && after.has(s.id) && (s.id === targetId || before.has(s.id)));
+    const pod = again.find((s) => s.service === "devpod" || s.service === "devpod-stop");
+    if (pod) return `The ${KIND_WORD[pod.service]} step ${name(pod.id)} lies between ${name(targetId)} and ${name(gate.id)} and cannot run again`;
+    const ids = new Set(again.map((s) => s.id));
+    // A merge or batch would receive a result a second time: after a team, any that follows it;
+    // otherwise one between the two steps, or one that collects a step that runs again.
+    const node = (w?.steps || []).find((s) => isNode(s) && (target.service === "team" ? after.has(s.id) : ids.has(s.id) || (s.depends_on || []).some((dep) => ids.has(dep))));
+    if (node) return `A rejection cannot go back across the ${node.service} step ${name(node.id)}`;
+    return "";
+  }
+
+  // rejectTargets: the steps a gate's rejections can go back to, nearest first.
   function rejectTargets(w, gate) {
-    return (gate.depends_on || []).filter((id) => (w?.steps || []).some((s) => s.id === id && s.service === "team"));
+    return ancestors(w, gate.id).filter((id) => !rejectRefusal(w, gate, id));
+  }
+
+  // backEdgeTip says what goes back along a gate's back edge.
+  function backEdgeTip(gate, target, name = (id) => id) {
+    const what = target?.service === "team"
+      ? `goes to the lead of ${name(gate.on_reject)} as a message with the reason, and the team works on`
+      : `goes back to ${name(gate.on_reject)} with the reason, its previous result and the reviewed documents, and it runs again with the steps after it`;
+    return `A rejection at ${name(gate.id)} ${what}; a click removes it`;
+  }
+
+  // backEdgeRoute decides how a gate's back edge runs to its target (both by their top-left
+  // corners; others are the other tiles, size a tile's { w, h }). It leaves the Rejected port
+  // on the gate's right edge and enters a side of the target at the same height, along
+  // straight lines that keep clear of every tile: beside the tiles in the free channel
+  // between two columns and, when a tile stands in the way, through the gap above or below a
+  // row. pad is how far the target's outline reaches past its box on the right (a team's
+  // stack). Returns the corner points, the path, and whether it is clear of every tile.
+  const REJECT_PORT_Y = 20, BACK_LANE = 28, BACK_GAP = 36, BACK_CLEAR = 6, BACK_TIP = 9;
+  function backEdgeRoute(gate, target, others, size, pad = 0) {
+    const { w, h } = size;
+    const tiles = (others || []).filter(Boolean);
+    const start = { x: gate.x + w, y: gate.y + REJECT_PORT_Y };
+    const endY = target.y + REJECT_PORT_Y;
+    const right = target.x + w + pad;
+    const near = (a, b, box) => Math.min(a.x, b.x) < box.x + w + BACK_CLEAR && Math.max(a.x, b.x) > box.x - BACK_CLEAR
+      && Math.min(a.y, b.y) < box.y + h + BACK_CLEAR && Math.max(a.y, b.y) > box.y - BACK_CLEAR;
+    // The first line leaves the gate and the last one enters the target; every other line keeps clear of both.
+    const clear = (points) => points.every((p, i) => i === 0 || ![...tiles, ...(i > 1 ? [gate] : []), ...(i < points.length - 1 ? [target] : [])].some((box) => near(points[i - 1], p, box)));
+    const length = (points) => points.reduce((sum, p, i) => (i ? sum + Math.abs(p.x - points[i - 1].x) + Math.abs(p.y - points[i - 1].y) : 0), 0);
+    // end is where the edge meets the target: its right side from a lane right of it, its left side from one left of it.
+    const end = (lane) => (lane > right ? { x: right, y: endY, dir: -1 } : lane < target.x ? { x: target.x, y: endY, dir: 1 } : null);
+    const own = gate.x + w + BACK_LANE; // the channel right of the gate
+    const candidates = [];
+    for (const lane of new Set([own, right + BACK_LANE])) {
+      const to = end(lane);
+      if (to && lane >= start.x + BACK_LANE / 2) candidates.push([start, { x: lane, y: start.y }, { x: lane, y: endY }, to]);
+    }
+    for (const lane of [right + BACK_LANE, target.x - BACK_LANE]) {
+      const to = end(lane);
+      if (!to || lane === own) continue;
+      for (const box of [gate, target, ...tiles]) for (const y of [box.y - BACK_GAP, box.y + h + BACK_GAP]) {
+        candidates.push([start, { x: own, y: start.y }, { x: own, y }, { x: lane, y }, { x: lane, y: endY }, to]);
+      }
+    }
+    let points = candidates.filter(clear).sort((a, b) => length(a) - length(b))[0];
+    const isClear = !!points;
+    if (!points) {
+      // Nothing is free: around everything on the right, the nearest to "never across a tile".
+      const lane = Math.max(right, ...[gate, ...tiles].map((box) => box.x + w)) + BACK_LANE;
+      points = [start, { x: lane, y: start.y }, { x: lane, y: endY }, end(lane)];
+    }
+    const to = points[points.length - 1];
+    const corners = [...points.slice(0, -1), { x: to.x - to.dir * BACK_TIP, y: to.y }] // room for the arrowhead
+      .filter((p, i, all) => !i || p.x !== all[i - 1].x || p.y !== all[i - 1].y);
+    // Straight lines with rounded corners.
+    let d = `M${corners[0].x},${corners[0].y}`;
+    for (let i = 1; i < corners.length; i++) {
+      const p = corners[i], before = corners[i - 1], next = corners[i + 1];
+      if (!next) { d += ` L${p.x},${p.y}`; break; }
+      const r = Math.min(8, (Math.abs(p.x - before.x) + Math.abs(p.y - before.y)) / 2, (Math.abs(next.x - p.x) + Math.abs(next.y - p.y)) / 2);
+      const from = { x: p.x - Math.sign(p.x - before.x) * r, y: p.y - Math.sign(p.y - before.y) * r };
+      const on = { x: p.x + Math.sign(next.x - p.x) * r, y: p.y + Math.sign(next.y - p.y) * r };
+      d += ` L${from.x},${from.y} Q${p.x},${p.y} ${on.x},${on.y}`;
+    }
+    return { points: corners, d, clear: isClear };
   }
 
   // The version and the path of a nested workflow travel in the hash:
@@ -285,13 +409,50 @@ const WorkflowLogic = (() => {
   // nodeSubtitle is the second line of a merge or batch tile.
   const nodeSubtitle = (s) => (s.service === "merge" ? "Waits for all" : Number(s.size) > 0 ? `Collects ${s.size}` : "Collects");
 
+  // ---- Dev pod steps ----
+  // A devpod step starts the run's dev pod (a sandbox with a clone of a repository on a work
+  // branch), a command step runs one command in it without a model, and a devpod-stop step
+  // deletes it.
+  const POD_KINDS = ["devpod", "command", "devpod-stop"];
+  const isPodKind = (s) => POD_KINDS.includes(s?.service);
+  const DEFAULT_WORK_BRANCH = "agent/{run}"; // {run} stands for the first 8 characters of the run ID
+  const RULE_TOOLS = ["write_file", "edit_file", "run_command"];
+  // What each kind has beyond the fields of every step, and the fields only these kinds have.
+  const POD_FIELDS = {
+    devpod: ["repository", "source_branch", "work_branch", "name", "protected", "rules", "timeout", "max_attempts"],
+    command: ["command", "timeout", "allow_failure"],
+    "devpod-stop": [],
+  };
+  const POD_ONLY = ["repository", "source_branch", "work_branch", "name", "protected", "rules", "command", "allow_failure"];
+
+  // podSubtitle is the second line of a dev pod, command or stop tile.
+  function podSubtitle(s) {
+    if (s.service === "devpod") return s.repository ? `${s.repository} · ${s.work_branch || DEFAULT_WORK_BRANCH}` : "No repository";
+    if (s.service === "command") return String(s.command || "").trim() || "No command";
+    return "Deletes the dev pod";
+  }
+
+  // linesOf reads a field with one entry per line: trimmed, without the empty lines.
+  const linesOf = (typed) => String(typed ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
+
+  // ruleWith returns a rule with one field changed, as it is stored: tool and message always,
+  // path and matches only when they hold something.
+  function ruleWith(rule, key, value) {
+    const next = { ...rule, [key]: String(value ?? "").trim() };
+    const out = { tool: RULE_TOOLS.includes(next.tool) ? next.tool : RULE_TOOLS[0] };
+    for (const part of ["path", "matches"]) if (next[part]) out[part] = next[part];
+    out.message = next.message || "";
+    return out;
+  }
+
   // dropForeignFields removes the fields that do not belong to the step's kind: a merge or
-  // batch keeps only its parameters, and any other kind loses the parameters of the nodes.
+  // batch keeps only its parameters, a dev pod, command or stop step only its own fields, and
+  // any other kind loses the fields only those kinds have.
   function dropForeignFields(s) {
-    const own = isNode(s) ? Object.keys(NODE_PARAMS[s.service]) : null;
+    const own = isNode(s) ? Object.keys(NODE_PARAMS[s.service]) : isPodKind(s) ? POD_FIELDS[s.service] : null;
     for (const key of Object.keys(s)) {
       if (KEPT_FIELDS.includes(key)) continue;
-      if (own ? !own.includes(key) : key in PARAM_NAME) delete s[key];
+      if (own ? !own.includes(key) : key in PARAM_NAME || POD_ONLY.includes(key)) delete s[key];
     }
     return s;
   }
@@ -304,10 +465,39 @@ const WorkflowLogic = (() => {
   }
 
   // stepProblems: why the orchestrator would refuse this step, one sentence each; empty when
-  // fine. It covers merge and batch nodes, and a route step that follows one.
-  function stepProblems(w, s) {
+  // fine. It covers merge and batch nodes, a route step that follows one, the dev pod steps,
+  // and a gate's back edge. name turns a step ID into what the page shows.
+  function stepProblems(w, s, name = (id) => id) {
     const problems = [];
     const deps = s.depends_on || [];
+    const whole = (value) => Number.isInteger(value) && value >= 1;
+    const byId = stepsById(w);
+    // The steps this one comes after, directly or through others.
+    const before = () => [...new Set(deps.flatMap((dep) => [dep, ...ancestors(w, dep)]))].map((id) => byId.get(id)).filter(Boolean);
+    if (s.service === "devpod") {
+      const source = String(s.source_branch || "").trim(), work = String(s.work_branch || "").trim();
+      if (!s.repository) problems.push("A dev pod needs a repository");
+      if (!source) problems.push("A dev pod needs a source branch");
+      if (!work) problems.push("A dev pod needs a work branch");
+      else if (work === source) problems.push("The work branch must differ from the source branch");
+      const other = (w?.steps || []).find((o) => o !== s && o.id !== s.id && o.service === "devpod");
+      if (other) problems.push(`A workflow has only one dev pod step, and ${name(other.id)} is another`);
+      const node = before().find(isNode);
+      if (node) problems.push(`A dev pod cannot come after the ${node.service} step ${name(node.id)}`);
+      (Array.isArray(s.rules) ? s.rules : []).forEach((rule, i) => {
+        if (!RULE_TOOLS.includes(rule?.tool)) problems.push(`Rule ${i + 1} needs a tool`);
+        if (!String(rule?.message || "").trim()) problems.push(`Rule ${i + 1} needs a message that names the rule, the reason and the fix`);
+        try { new RegExp(rule?.matches || ""); } catch { problems.push(`Rule ${i + 1} has a pattern that is not a regular expression`); }
+      });
+    }
+    if (s.service === "command" || s.service === "devpod-stop") {
+      if (s.service === "command" && !String(s.command || "").trim()) problems.push("A command step needs a command");
+      if (!before().some((o) => o.service === "devpod")) problems.push(`A ${s.service === "command" ? "command" : "stop"} step must come after the dev pod step`);
+    }
+    if (s.service === "gate") {
+      if (s.on_reject) { const refusal = rejectRefusal(w, s, s.on_reject, name); if (refusal) problems.push(refusal); }
+      if (s.max_rejections !== undefined && s.max_rejections !== null && s.max_rejections !== "" && !whole(s.max_rejections)) problems.push("Max rejections must be a whole number of 1 or more");
+    }
     if (isNode(s)) {
       const word = s.service === "merge" ? "A merge" : "A batch";
       if (!deps.length) problems.push(`${word} needs at least one source`);
@@ -332,9 +522,16 @@ const WorkflowLogic = (() => {
   // interactive session a pill (a speech bubble), a router a signpost pointing on, a workflow a
   // square-cornered box for its side bands, a merge a funnel (wide at the top, narrow at the
   // bottom: many results become one message), a batch a tray (a plain box; the page draws a
-  // second line under its top edge), a team and anything else the rounded rectangle.
+  // second line under its top edge), a dev pod a hexagon (a pod: a point on each side), a
+  // command a slanted box (the flowchart sign for a manual step: it runs without a model), a
+  // stop step a box notched on each side (the pod's points turned inwards: it is taken away),
+  // a team and anything else the rounded rectangle.
   const FUNNEL_NECK = 28, FUNNEL_RIM = 20; // how far the funnel narrows on each side, and where it starts to
+  const POD_POINT = 14, COMMAND_SLANT = 12;
   function tileOutline(kindName, w, h) {
+    if (kindName === "devpod") { const p = POD_POINT; return `M${p},0 H${w - p} L${w},${h / 2} L${w - p},${h} H${p} L0,${h / 2} z`; }
+    if (kindName === "devpod-stop") { const p = POD_POINT; return `M0,0 H${w} L${w - p},${h / 2} L${w},${h} H0 L${p},${h / 2} z`; }
+    if (kindName === "command") { const c = COMMAND_SLANT; return `M${c},0 H${w} L${w - c},${h} H0 z`; }
     const round = (r) => `M${r},0 H${w - r} A${r},${r} 0 0 1 ${w},${r} V${h - r} A${r},${r} 0 0 1 ${w - r},${h} H${r} A${r},${r} 0 0 1 0,${h - r} V${r} A${r},${r} 0 0 1 ${r},0 z`;
     if (kindName === "gate") { const c = 14; return `M${c},0 H${w - c} L${w},${c} V${h - c} L${w - c},${h} H${c} L0,${h - c} V${c} z`; }
     if (kindName === "interactive") return round(h / 2);
@@ -347,6 +544,8 @@ const WorkflowLogic = (() => {
 
   return {
     NODE_KINDS, isNode, NODE_PARAMS, nodeSubtitle, dropForeignFields, paramValue, stepProblems, tileOutline,
+    POD_KINDS, isPodKind, DEFAULT_WORK_BRANCH, RULE_TOOLS, podSubtitle, linesOf, ruleWith,
+    REJECT_KINDS, ancestors, dependents, rejectRefusal, backEdgeTip, backEdgeRoute, REJECT_PORT_Y,
     RESERVED_MEMBER, memberName, teamMembers, channelId, defaultChannels, teamChannels, toggleChannel, pruneChannels, MEMBER_H, ONE_WAY, channelSender, setChannelDirection,
     teamProblems, memberTip, setLead, removeMember, nestedRefs, nestedNames, reachesWorkflow, nestableWorkflows, renameWorkflowRefs,
     newestRef, versionWord, versionOptions, storable, fingerprint, headState, runBlocker,
@@ -363,15 +562,21 @@ const WorkflowLogic = (() => {
   const BAND_W = 12; // the side bands of a workflow node
   const TOP = 40, ROW_H = TILE_H + 72, COL_W = TILE_W + 48, GRAPH_MARGIN = 32;
   const L = WorkflowLogic;
-  const SPECIAL = ["agent", "gate", "interactive", "route", "workflow", "team", "merge", "batch"];
+  const SPECIAL = ["agent", "gate", "interactive", "route", "workflow", "team", "merge", "batch", ...L.POD_KINDS];
   const TYPE_ICON = { agent: "agent", gate: "gate", interactive: "chat", route: "workflow", workflow: "workflow" };
-  const TYPE_NAME = { agent: "Agent", gate: "Human Gate", interactive: "Interactive Session", route: "Router", workflow: "Workflow", team: "Team", merge: "Merge", batch: "Batch" };
+  const TYPE_NAME = { agent: "Agent", gate: "Human Gate", interactive: "Interactive Session", route: "Router", workflow: "Workflow", team: "Team", merge: "Merge", batch: "Batch", devpod: "Dev Pod", "devpod-stop": "Stop Dev Pod", command: "Command" };
+  // A new step is named by its kind and the lowest free number: Step 1, Dev Pod 1, Stop Dev Pod 1.
+  const STEP_WORD = { agent: "step", devpod: "dev-pod", "devpod-stop": "stop-dev-pod" };
   // A team's tile icon: three members joined by channels.
   const TEAM_ICON = '<circle cx="8" cy="4" r="2"/><circle cx="3.5" cy="12" r="2"/><circle cx="12.5" cy="12" r="2"/><path d="M7 5.8L4.6 10.2M9 5.8l2.4 4.4M5.5 12h5"/>';
   // A merge's tile icon: two lines that join into one. A batch's: three results stacked in a tray.
   const MERGE_ICON = '<path d="M3 2.5l5 5.5v5.5M13 2.5L8 8"/>';
   const BATCH_ICON = '<path d="M2 9.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V9.5"/><path d="M5 10h6M5 6.5h6M5 3h6"/>';
-  const KIND_ICON = { team: TEAM_ICON, merge: MERGE_ICON, batch: BATCH_ICON };
+  // A dev pod's tile icon: a box. A command's: a shell prompt. A stop step's: the box crossed out.
+  const DEVPOD_ICON = '<path d="M8 2l5 2.8v6.4L8 14l-5-2.8V4.8z"/><path d="M3 4.8l5 2.8 5-2.8M8 7.6V14"/>';
+  const COMMAND_ICON = '<path d="M3 4.5L6.5 8 3 11.5M8.5 12H13"/>';
+  const DEVPOD_STOP_ICON = '<rect x="3" y="3" width="10" height="10" rx="1.5"/><path d="M6 6l4 4M10 6l-4 4"/>';
+  const KIND_ICON = { team: TEAM_ICON, merge: MERGE_ICON, batch: BATCH_ICON, devpod: DEVPOD_ICON, command: COMMAND_ICON, "devpod-stop": DEVPOD_STOP_ICON };
   // An agent step runs one agent; an interactive step lets a person chat with its main agent
   // (agent) and any further ones (agents).
   const usesAgent = (s) => s.service === "agent" || s.service === "interactive";
@@ -384,6 +589,7 @@ const WorkflowLogic = (() => {
     baseline: "", // the fingerprint of that version as stored
     selected: null, dirty: false, saving: false, loaded: false,
     loadError: "", stale: true, agentRefs: [], agentsLoaded: false, inspectorOpen: true,
+    repos: [], reposLoaded: false, reposError: "", // the Git repositories of the Connectors page, for a dev pod step
     path: [], // references of the workflows the current one was opened through, root first
     teamOpen: null, // { workflow, step }: the team node opened on the canvas
   };
@@ -560,6 +766,17 @@ const WorkflowLogic = (() => {
     } catch (e) { setStatus(`Cannot load agents: ${e.message}`, "error"); }
   }
 
+  // loadRepositories fills the Repository choice of a dev pod step from the connector service.
+  // A failure stays quiet: the field says why it offers nothing.
+  async function loadRepositories() {
+    try {
+      state.repos = ConnectorsLogic.repositories(await api("GET", "/api/connectors/git/repositories"));
+      state.reposLoaded = true;
+      state.reposError = "";
+    } catch (e) { state.reposError = `Cannot list the repositories: ${e.message}`; }
+    renderInspector();
+  }
+
   // ---- Layout ----
 
   // autoLayout gives steps without a position a row per dependency depth; siblings sit side by side.
@@ -673,6 +890,7 @@ const WorkflowLogic = (() => {
       case "gate": return s.question || "";
       case "route": return "";
       case "merge": case "batch": return L.nodeSubtitle(s);
+      case "devpod": case "command": case "devpod-stop": return L.podSubtitle(s);
       case "workflow": return missingAgent(s) ? `Missing: ${refLabel(s.workflow)}` : refLabel(s.workflow || ""); // the workflow and its pinned version
       case "team": {
         if (missingAgent(s)) return `Missing: ${missingRef(s)}`;
@@ -696,8 +914,12 @@ const WorkflowLogic = (() => {
   function render() {
     const w = workflow();
     if (w && w.steps.length && (!state.selected || !step(state.selected))) state.selected = firstStep(w).id;
-    // A gate returns rejections only to a team it still depends on.
-    for (const s of w?.steps || []) if (s.on_reject && !(s.service === "gate" && L.rejectTargets(w, s).includes(s.on_reject))) delete s.on_reject;
+    // A back edge belongs to a gate and leads to a step that exists; one the orchestrator would
+    // refuse for another reason stays and shows as a problem in the gate's panel.
+    for (const s of w?.steps || []) {
+      if (s.on_reject && !(s.service === "gate" && step(s.on_reject))) delete s.on_reject;
+      if (!s.on_reject && s.max_rejections !== undefined) delete s.max_rejections;
+    }
     // An opened team closes when its workflow or its step is gone from the canvas.
     if (state.teamOpen && (state.teamOpen.workflow !== w?.name || step(state.teamOpen.step)?.service !== "team")) state.teamOpen = null;
     refreshDirty();
@@ -980,6 +1202,8 @@ const WorkflowLogic = (() => {
         const x = f ? laneX(outPort(f), inPort(s), bowsLeft(w, f, s)) : null;
         if (x !== null) boxes.push({ x: x - 8, y: s.position.y, w: 16, h: TILE_H });
       }
+      // So do the back edges, which run around the tiles.
+      for (const s of w.steps) for (const p of backEdge(w, s)?.points || []) boxes.push({ x: p.x - 8, y: p.y - 8, w: 16, h: 16 });
       const minX = Math.min(...boxes.map((b) => b.x)), maxX = Math.max(...boxes.map((b) => b.x + b.w));
       const minY = Math.min(...boxes.map((b) => b.y));
       const graphW = maxX - minX;
@@ -1025,6 +1249,8 @@ const WorkflowLogic = (() => {
     const defs = el("defs", {}, svg);
     const marker = el("marker", { id: "arrow", viewBox: "0 0 10 10", refX: 2, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, defs);
     el("path", { d: "M0,0 L10,5 L0,10 z", fill: "var(--edge)" }, marker);
+    const rejectMarker = el("marker", { id: "arrow-reject", viewBox: "0 0 10 10", refX: 2, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, defs);
+    el("path", { d: "M0,0 L10,5 L0,10 z", fill: "var(--failed)" }, rejectMarker);
     renderCanvasMessage();
     const w = workflow();
     // An opened team takes the place of the graph: its members and channels, as in the node panel.
@@ -1050,15 +1276,37 @@ const WorkflowLogic = (() => {
       }
     }
 
+    // A gate's back edge: where its rejections go. Dashed, in the failed colour, around the tiles.
+    for (const s of w.steps) {
+      const route = backEdge(w, s);
+      if (!route) continue;
+      const g = el("g", { class: "back-edge-group", "data-gate": s.id }, root);
+      el("title", {}, g).textContent = L.backEdgeTip(s, step(s.on_reject), titleCase);
+      el("path", { d: route.d, class: "edge-hit" }, g);
+      el("path", { d: route.d, class: "back-edge", "marker-end": "url(#arrow-reject)" }, g);
+      g.onclick = () => removeBackEdge(s);
+      g.addEventListener("contextmenu", (ev) => openMenu(ev, [["Remove back edge", () => removeBackEdge(s), "danger", `A rejection at ${titleCase(s.id)} ends the run again`]]));
+    }
+
     const ip = inputPos(w);
     if (ip) {
-      for (const s of w.steps.filter((x) => !(x.depends_on || []).length)) {
+      const savedIds = new Set((state.baseline ? JSON.parse(state.baseline).steps : []).map((s) => s.id));
+      for (const s of w.steps.filter((s) => savedIds.has(s.id) && !(s.depends_on || []).length)) {
         el("path", { d: edgePath({ x: ip.x + TILE_W / 2, y: ip.y + TILE_H }, inPort(s)), class: "edge input-edge", "marker-end": "url(#arrow)" }, root);
       }
       drawInputTile(root, defs, ip);
     }
 
     w.steps.forEach((s, i) => drawTile(root, defs, s, i));
+  }
+
+  // backEdge is the route of a gate's back edge to the step its rejections go to, or null for
+  // a step without one. A team's outline reaches 8 px past its box, where its stack shows.
+  function backEdge(w, s) {
+    const target = s.service === "gate" && s.on_reject ? w.steps.find((o) => o.id === s.on_reject) : null;
+    if (!target?.position || !s.position || target === s) return null;
+    return L.backEdgeRoute(s.position, target.position, w.steps.filter((o) => o !== s && o !== target && o.position).map((o) => o.position),
+      { w: TILE_W, h: TILE_H }, target.service === "team" ? 8 : 0);
   }
 
   // inputPos places the input node one row above the first steps, centred over them.
@@ -1088,7 +1336,7 @@ const WorkflowLogic = (() => {
 
   // The outline of a tile comes from WorkflowLogic.tileOutline. Icon and text move in by this
   // much where a band or a slanted edge takes the room.
-  const TILE_PAD = { workflow: BAND_W, gate: 6, interactive: 8, merge: 12 };
+  const TILE_PAD = { workflow: BAND_W, gate: 6, interactive: 8, merge: 12, devpod: 10, command: 8, "devpod-stop": 12 };
   const TRAY_LINE_Y = 8; // a batch's second line, under the bar at its top edge
 
   function drawTile(root, defs, s, i) {
@@ -1137,6 +1385,13 @@ const WorkflowLogic = (() => {
       el("title", {}, out).textContent = "Creates a dependency when dragged onto another step";
       out.onpointerdown = (ev) => startConnect(ev, s);
     }
+    // A gate has a second output port, Rejected, on its right edge below the corner: clear of
+    // the output port at the bottom and of the arrows that enter a tile's side at its middle.
+    if (s.service === "gate") {
+      const rejected = el("circle", { class: "port port-reject", cx: W, cy: L.REJECT_PORT_Y, r: 5 }, g);
+      el("title", {}, rejected).textContent = "Rejected: sends a rejection back to an earlier step when dragged onto it";
+      rejected.onpointerdown = (ev) => startReject(ev, s);
+    }
     g.addEventListener("contextmenu", (ev) => {
       if (state.selected !== s.id) { state.selected = s.id; render(); }
       openMenu(ev, stepActions(s));
@@ -1161,7 +1416,7 @@ const WorkflowLogic = (() => {
       const card = usesAgent(s) && s.agent ? agentCard(s.agent)
         : s.service === "team" ? teamPanel(s) : s.service === "workflow" ? nestedCard(s) : null;
       // What the orchestrator would refuse on Save shows under the fields, like a team's problems.
-      const problems = L.stepProblems(w, s).map((p) => h("p", { className: "error-text team-problem" }, p.replace(/: (.+)$/, (_, id) => `: ${titleCase(id)}`)));
+      const problems = L.stepProblems(w, s, titleCase).map((p) => h("p", { className: "error-text team-problem" }, p.replace(/: (.+)$/, (_, id) => `: ${titleCase(id)}`)));
       box.replaceChildren(
         h("div", { className: "panel-head" }, h("h2", {}, typeName(s))),
         h("div", { className: "panel-body" },
@@ -1202,9 +1457,25 @@ const WorkflowLogic = (() => {
       else if (!s.workflow) { const first = nestable()[0]; if (first) s.workflow = pinNewest(first); }
       if (v === "workflow" || v === "team") delete s.max_attempts;
       if (v === "workflow") delete s.timeout;
-      // A merge or batch keeps only its parameters; any other kind loses them.
+      // A merge or batch keeps only its parameters, a dev pod step only its own fields; any
+      // other kind loses them.
       L.dropForeignFields(s);
+      if (v === "devpod") podDefaults(s);
     },
+    // A dev pod step: a chosen repository brings its default branch as the source branch.
+    repository(s, v) {
+      if (v) s.repository = v; else delete s.repository;
+      const repo = state.repos.find((r) => r.name === v);
+      if (repo && !s.source_branch) s.source_branch = repo.defaultBranch;
+    },
+    source_branch(s, v) { if (v) s.source_branch = v; else delete s.source_branch; },
+    work_branch(s, v) { if (v) s.work_branch = v; else delete s.work_branch; },
+    name(s, v) { if (v) s.name = v; else delete s.name; },
+    protected(s, v) { const paths = L.linesOf(v); if (paths.length) s.protected = paths; else delete s.protected; },
+    // A command step: one command, on one line.
+    command(s, v) { v = v.replace(/\s*\n\s*/g, " "); if (v) s.command = v; else delete s.command; },
+    allow_failure(s, on) { if (on === true) s.allow_failure = true; else delete s.allow_failure; },
+    max_rejections(s, v) { const n = L.paramValue(v); if (n === undefined) delete s.max_rejections; else s.max_rejections = n; },
     // The parameters of a merge or batch: whole numbers, left out while empty.
     capacity(s, v) { const n = L.paramValue(v); if (n === undefined) delete s.capacity; else s.capacity = n; },
     size(s, v) { const n = L.paramValue(v); if (n === undefined) delete s.size; else s.size = n; },
@@ -1212,7 +1483,7 @@ const WorkflowLogic = (() => {
     // A chosen workflow is pinned to its newest version; Version pins another one.
     workflow(s, v) { if (v) s.workflow = pinNewest(v); else delete s.workflow; },
     workflow_version(s, v) { const n = Number(v); if (s.workflow && n > 0) s.workflow = WorkflowRef.format(WorkflowRef.nameOf(s.workflow), n); },
-    on_reject(s, v) { if (v) s.on_reject = v; else delete s.on_reject; },
+    on_reject(s, v) { if (v) s.on_reject = v; else { delete s.on_reject; delete s.max_rejections; } },
     max_turns(s, v) { const n = parseInt(v, 10); if (n > 0) s.max_turns = n; else delete s.max_turns; },
     // lead: another agent leads the team; a member that becomes the lead swaps places with the old one.
     lead(s, v) {
@@ -1236,6 +1507,48 @@ const WorkflowLogic = (() => {
     timeout(s, v) { if (v) s.timeout = v; else delete s.timeout; },
     attempts(s, v) { const n = parseInt(v, 10); if (n >= 0) s.max_attempts = n + 1; else delete s.max_attempts; },
   };
+
+  // podDefaults gives a new dev pod step what it starts with: the default work branch and, as
+  // a new agent step gets the first agent, the first repository with its default branch.
+  function podDefaults(s) {
+    if (!s.work_branch) s.work_branch = L.DEFAULT_WORK_BRANCH;
+    const first = state.repos[0];
+    if (!s.repository && first) { s.repository = first.name; if (!s.source_branch) s.source_branch = first.defaultBranch; }
+  }
+
+  // editRules changes the rules of a dev pod step; a step without rules stores none.
+  function editRules(s, change) {
+    const current = step(s.id);
+    if (!current) return;
+    const rules = change(Array.isArray(current.rules) ? [...current.rules] : []);
+    if (rules.length) current.rules = rules; else delete current.rules;
+    markDirty();
+    refreshAfterEdit();
+  }
+
+  // rulesEditor is the small list editor of a dev pod's rules: each blocks a tool call of the
+  // agent (by tool, path and content or command) and answers it with a message.
+  function rulesEditor(s) {
+    const rules = Array.isArray(s.rules) ? s.rules : [];
+    const part = (i, key, label, control, tip, className = "") => {
+      control.id = `inspector-rule-${i}-${key}`;
+      control.dataset.field = `rule-${i}-${key}`; // focus returns here after a redraw; stepFields has no such field
+      control.addEventListener("change", () => editRules(s, (list) => { if (list[i]) list[i] = L.ruleWith(list[i], key, control.value); return list; }));
+      return h("div", { className: `field ${className}`.trim() }, h("label", { htmlFor: control.id, title: tip }, label), control);
+    };
+    const text = (value, placeholder) => h("input", { value: value ?? "", placeholder, autocomplete: "off", spellcheck: false });
+    const add = iconButton("plus", "Add rule", () => editRules(s, (list) => [...list, { tool: L.RULE_TOOLS[0], message: "" }]));
+    return h("div", { className: "field field-wide" },
+      h("div", { className: "pod-rules-head" }, h("label", { id: "inspector-rules-label", title: "A rule blocks a tool call of the agent in the dev pod and answers it with its message" }, "Rules"), add),
+      h("div", { className: "pod-rules", role: "group", "aria-labelledby": "inspector-rules-label" },
+        rules.length ? rules.map((rule, i) => h("div", { className: "pod-rule", role: "group", "aria-label": `Rule ${i + 1}` },
+          part(i, "tool", "Tool", h("select", {}, ...L.RULE_TOOLS.map((tool) => h("option", { value: tool, selected: tool === rule.tool }, tool))), "The tool call the rule blocks"),
+          part(i, "path", "Path", text(rule.path, "Any path"), "A glob such as src/panel/**; the rule applies to files that match it"),
+          part(i, "matches", "Matches", text(rule.matches, "Any content"), "A regular expression on the new content of the file, or on the command"),
+          iconButton("close", `Remove rule ${i + 1}`, () => editRules(s, (list) => list.filter((_, at) => at !== i))),
+          part(i, "message", "Message", text(rule.message, "Not set"), "What the agent is told: the rule, the reason and the fix", "pod-rule-message")))
+          : h("p", { className: "none" }, "No rules")));
+  }
 
   // stepForm builds the inspector fields of a step.
   function stepForm(s) {
@@ -1279,15 +1592,27 @@ const WorkflowLogic = (() => {
       lead = h("select", {}, s.agent ? null : h("option", { value: "" }, "No agent"),
         ...refs.map((r) => h("option", { value: r, selected: r === s.agent }, state.agentsLoaded && !state.agentRefs.includes(r) ? `${r} (missing)` : r)));
     }
-    // A gate can send a rejection back to a team it depends on.
+    // A gate can send a rejection back to an earlier step it depends on: the allowed ones are
+    // offered, and one that is set but not allowed is listed as such (its problem shows below).
     let onReject = null;
     if (s.service === "gate") {
       const targets = L.rejectTargets(workflow(), s);
-      if (targets.length) {
-        onReject = h("select", {}, h("option", { value: "" }, "Not set"),
-          ...targets.map((t) => h("option", { value: t, selected: t === s.on_reject }, titleCase(t))));
-      }
+      const listed = s.on_reject && !targets.includes(s.on_reject) ? [s.on_reject, ...targets] : targets;
+      onReject = h("select", {}, h("option", { value: "" }, "Nobody: a rejection ends the run"),
+        ...listed.map((t) => h("option", { value: t, selected: t === s.on_reject }, targets.includes(t) ? titleCase(t) : `${titleCase(t)} (not allowed)`)));
     }
+    // A dev pod step clones one of the repositories of the Connectors page.
+    let repository = null;
+    if (s.service === "devpod") {
+      const names = state.repos.map((r) => r.name);
+      if (s.repository && !names.includes(s.repository)) names.unshift(s.repository);
+      repository = h("select", { title: state.reposError || undefined }, s.repository ? null : h("option", { value: "" }, "Not set"),
+        ...names.map((n) => h("option", { value: n, selected: n === s.repository }, state.reposLoaded && !state.repos.some((r) => r.name === n) ? `${n} (missing)` : n)));
+    }
+    // A command is one line of shell: its box wraps and grows with it, like a gate's question.
+    const command = s.service === "command" ? h("textarea", { rows: 1, className: "code", value: s.command ?? "", placeholder: "Not set", spellcheck: false }) : null;
+    const allowFailure = s.service === "command" ? h("input", { type: "checkbox", checked: s.allow_failure === true }) : null;
+    const protectedPaths = s.service === "devpod" ? h("textarea", { rows: 2, className: "pod-lines", value: (s.protected || []).join("\n"), placeholder: "No protected paths", spellcheck: false }) : null;
     // A merge or batch shows its sources (changed by drawing arrows, as for every step) and its
     // parameters: plain digit fields whose placeholder is the default.
     const node = L.isNode(s);
@@ -1322,39 +1647,54 @@ const WorkflowLogic = (() => {
         s.service === "interactive" ? field("Main agent", "agent", agent, false, "The agent the first chat tab opens with") : null,
         more ? field("Agents", "agents", more, false, "Further agents a new chat tab can be opened with") : null,
         activity ? field("Activity", "activity", activity) : null,
-        field("Service", "service", service, false, "agent runs an agent; gate waits for a person; interactive opens a chat session with its agents; route starts the workflow named in the route field of its input; workflow runs another workflow; team lets a lead agent and its members work together; merge waits for a result from every source and forwards them together; batch collects results and forwards them together once it holds its size; any other name is a Temporal task queue"),
+        repository ? field("Repository", "repository", repository, false, "The Git repository the dev pod clones, one of those on the Connectors page") : null,
+        repository ? field("Source branch", "source_branch", input(s.source_branch, { placeholder: "Not set", spellcheck: false }), false, "The branch the work starts from") : null,
+        repository ? field("Work branch", "work_branch", input(s.work_branch, { placeholder: L.DEFAULT_WORK_BRANCH, spellcheck: false }), false, "The branch the agents commit to, never the source or the default branch; {run} stands for the first 8 characters of the run ID") : null,
+        repository ? field("Name", "name", input(s.name, { placeholder: "No name", spellcheck: false }), false, "A later run with the same repository and name continues in the live dev pod of that name; without a name every run gets a new dev pod") : null,
+        field("Service", "service", service, false, "agent runs an agent; gate waits for a person; interactive opens a chat session with its agents; route starts the workflow named in the route field of its input; workflow runs another workflow; team lets a lead agent and its members work together; merge waits for a result from every source and forwards them together; batch collects results and forwards them together once it holds its size; devpod starts a dev pod with a clone of a repository on a work branch; command runs one command in the dev pod without a model; devpod-stop deletes the dev pod; any other name is a Temporal task queue"),
         s.service === "merge" ? h("div", { className: "field-pair" },
           field("Capacity", "capacity", digits("capacity", String(L.NODE_PARAMS.merge.capacity)), true, "How many entries may wait for a missing source at the same time; one more fails the run"),
           timeoutField("Seconds an entry may wait for its missing sources, counted from its first result; after that the run fails")) : null,
         s.service === "batch" ? h("div", { className: "field-pair" },
           field("Size", "size", digits("size", "Not set"), true, "How many results the batch collects before it forwards them together"),
           timeoutField("Seconds after the last result until a batch that is not full is forwarded anyway")) : null,
-        onReject ? field("On reject, return to", "on_reject", onReject, false, "The team that receives the reason of a rejection and works on; the gate opens again when it has finished") : null,
+        onReject ? field("Rejections go to", "on_reject", onReject, false, "The earlier step that receives a rejection with its reason and runs again, with the steps between it and the gate; the gate then opens again. A team gets the reason as a message to its lead") : null,
+        onReject && s.on_reject ? field("Max rejections", "max_rejections", digits("max_rejections", "5"), true, "How many rejections go back; one more ends the run as rejected") : null,
+        // A command runs for at most 10 minutes; a failing one fails the run unless it may fail.
+        command ? field("Timeout", "timeout", input(s.timeout, { placeholder: "10m", size: 4, maxLength: 6 }), true, "How long the command may run, such as 30s or 5m; 10m at most") : null,
+        allowFailure ? h("div", { className: "field check-field" },
+          h("label", { htmlFor: fid("allow_failure"), title: "Ticked, the run goes on when the command ends with an exit code other than 0; unticked, it fails the run" }, allowFailure, "Allow failure")) : null,
         // Timeout and Retries stay together at the right, also when the row wraps. Gates and routes
         // run no activity, so neither would do anything there.
         s.service === "team" ? h("div", { className: "field-pair" },
           field("Timeout", "timeout", input(s.timeout, { placeholder: "15m", size: 4, maxLength: 6 }), true, "How long one turn of a member may take, such as 5m or 15m"),
           field("Max turns", "max_turns", input(s.max_turns ?? "", { placeholder: "40", size: 4, maxLength: 4, inputMode: "numeric" }), true, "How many turns the members may take together before the team fails")) : null,
-        s.service === "gate" || s.service === "route" || s.service === "interactive" || s.service === "workflow" || s.service === "team" || node ? null : h("div", { className: "field-pair" },
+        s.service === "gate" || s.service === "route" || s.service === "interactive" || s.service === "workflow" || s.service === "team" || node || L.isPodKind(s) ? null : h("div", { className: "field-pair" },
           field("Timeout", "timeout", input(s.timeout, { placeholder: s.service === "agent" ? "2m" : "10m", size: 4, maxLength: 6 }), true, "How long one attempt may take, such as 30s or 10m"),
           field("Retries", "attempts", input(s.max_attempts ? s.max_attempts - 1 : "", { type: "number", min: 0, max: 99, placeholder: "0" }), true, "How often a failed attempt is retried"))),
       // A gate's question gets its own full-width row.
-      question ? field("Question", "question", question) : null);
+      question ? field("Question", "question", question) : null,
+      // A command gets its own full-width row, like a question; so do a dev pod's protected paths and rules.
+      command ? field("Command", "command", command, false, "The command the step runs in the dev pod, in /workspace; its exit code decides the step") : null,
+      protectedPaths ? h("div", { className: "field-wide" }, field("Protected paths", "protected", protectedPaths, false, "Files and folders the agent cannot change, one glob per line, such as tests/** or verify.sh")) : null,
+      s.service === "devpod" ? rulesEditor(s) : null);
+    if (allowFailure) { allowFailure.id = fid("allow_failure"); allowFailure.dataset.field = "allow_failure"; }
     // Name fields are as wide as their text, also while typing.
-    const fitted = [id, agent, activity, service, nested, nestedVersion, lead, onReject].filter(Boolean);
+    const one = question || command; // the one sentence or line that wraps and grows
+    const fitted = [id, agent, activity, service, nested, nestedVersion, lead, onReject, repository, ...["source_branch", "work_branch", "name"].map((name) => form.querySelector(`[data-field="${name}"]`))].filter(Boolean);
     const grow = (el) => { el.style.height = "auto"; el.style.height = `${el.scrollHeight + 2}px`; };
-    requestAnimationFrame(() => { for (const el of fitted) if (el.isConnected) fitWidth(el); if (question?.isConnected) grow(question); });
-    form.addEventListener("input", (ev) => { if (fitted.includes(ev.target)) fitWidth(ev.target); if (ev.target === question) grow(question); });
+    requestAnimationFrame(() => { for (const el of fitted) if (el.isConnected) fitWidth(el); if (one?.isConnected) grow(one); });
+    form.addEventListener("input", (ev) => { if (fitted.includes(ev.target)) fitWidth(ev.target); if (ev.target === one) grow(one); });
     form.addEventListener("keydown", (ev) => {
       if (ev.key !== "Enter") return;
-      if (ev.target === question) ev.preventDefault(); // the question stays one paragraph; Enter finishes it like the other fields
-      if (ev.target.tagName === "INPUT" || ev.target === question) ev.target.blur();
+      if (ev.target === one) ev.preventDefault(); // the question stays one paragraph; Enter finishes it like the other fields
+      if (ev.target.tagName === "INPUT" || ev.target === one) ev.target.blur();
     });
     form.addEventListener("change", (ev) => {
       const name = ev.target.dataset.field;
       const current = step(s.id);
       if (!name || !current || !stepFields[name]) return;
-      stepFields[name](current, ev.target.value.trim());
+      stepFields[name](current, ev.target.type === "checkbox" ? ev.target.checked : ev.target.value.trim());
       markDirty();
       refreshAfterEdit();
     });
@@ -1775,6 +2115,15 @@ const WorkflowLogic = (() => {
     drag = { kind: "connect", from: s, line: null };
   }
 
+  // startReject begins a drag from a gate's Rejected port: dropped on an earlier step, it sets
+  // where the gate's rejections go.
+  function startReject(ev, s) {
+    ev.stopPropagation();
+    if (ev.button !== 0) return;
+    if (ev.shiftKey) { startPan(ev); return; }
+    drag = { kind: "reject", from: s, line: null };
+  }
+
   function onPointerMove(ev) {
     if (!drag) return;
     if (drag.kind === "pan") {
@@ -1792,6 +2141,10 @@ const WorkflowLogic = (() => {
       drag.moved = true;
       view.touched = true;
       renderCanvas();
+    } else if (drag.kind === "reject") {
+      drag.line?.remove();
+      const from = { x: drag.from.position.x + TILE_W, y: drag.from.position.y + L.REJECT_PORT_Y };
+      drag.line = el("path", { d: `M${from.x},${from.y} L${p.x},${p.y}`, class: "back-edge", "marker-end": "url(#arrow-reject)" }, $("canvas").querySelector(".graph"));
     } else {
       drag.line?.remove();
       drag.line = el("path", { d: edgePath(outPort(drag.from), { x: p.x, y: p.y + 8 }), class: "edge", "marker-end": "url(#arrow)" }, $("canvas").querySelector(".graph"));
@@ -1810,6 +2163,16 @@ const WorkflowLogic = (() => {
     d.line?.remove();
     const p = point(ev);
     const target = workflow().steps.find((s) => p.x >= s.position.x && p.x <= s.position.x + TILE_W && p.y >= s.position.y && p.y <= s.position.y + TILE_H);
+    if (d.kind === "reject") {
+      // A drop the orchestrator would refuse is rejected at once, with the reason.
+      if (target && target !== d.from) {
+        const refusal = L.rejectRefusal(workflow(), d.from, target.id, titleCase);
+        if (refusal) setStatus(refusal, "error");
+        else { d.from.on_reject = target.id; markDirty(); }
+      }
+      render();
+      return;
+    }
     if (target && target !== d.from) {
       const deps = target.depends_on || [];
       if (deps.includes(d.from.id)) setStatus("That dependency already exists", "error");
@@ -1864,9 +2227,18 @@ const WorkflowLogic = (() => {
       items.push(
         ["Run workflow…", openInputs, "", blocked || `Opens Select Inputs to start runs of v${shownVersion()}`, !!blocked],
         "-",
-        ["Add step", () => addStep(), "", "Adds an agent step"],
+        ["Add agent", () => addStep("agent"), "", "Adds an agent node without connections"],
+        ["Add human gate", () => addStep("gate"), "", "Adds a human approval node without connections"],
+        ["Add interactive session", () => addStep("interactive"), "", "Adds a chat session node without connections"],
+        ["Add workflow", () => addStep("workflow"), "", "Adds a child workflow node without connections"],
+        ["Add team", () => addStep("team"), "", "Adds a team node without connections"],
+        ["Add router", () => addStep("route"), "", "Adds a routing node without connections"],
+        ["Add service", () => addStep("service"), "", "Adds a custom service node without connections"],
         ["Add merge", () => addStep("merge"), "", "Adds a merge node: it waits for a result from every source and forwards them together"],
         ["Add batch", () => addStep("batch"), "", "Adds a batch node: it collects results and forwards them together once it holds its size"],
+        ["Add dev pod", () => addStep("devpod"), "", "Adds a dev pod node: it starts a sandbox with a clone of a repository on a work branch"],
+        ["Add command", () => addStep("command"), "", "Adds a command node: it runs one command in the dev pod, without a model"],
+        ["Add stop dev pod", () => addStep("devpod-stop"), "", "Adds a node that deletes the dev pod"],
         ["Auto-arrange", autoArrange, "", "Discards the saved positions and lays the steps out top to bottom"],
         "-",
       );
@@ -1908,6 +2280,16 @@ const WorkflowLogic = (() => {
     });
   }
 
+  // removeBackEdge ends a gate's back edge: a rejection ends the run again.
+  function removeBackEdge(s) {
+    withUndo("Removed", () => {
+      delete s.on_reject;
+      delete s.max_rejections;
+      markDirty();
+      render();
+    });
+  }
+
   function removeAllDependencies(s) {
     delete s.depends_on;
     for (const o of workflow().steps) o.depends_on = (o.depends_on || []).filter((d) => d !== s.id);
@@ -1919,7 +2301,8 @@ const WorkflowLogic = (() => {
     let id = `${s.id}-copy`;
     for (let n = 2; step(id); n++) id = `${s.id}-copy-${n}`;
     const copy = { id, service: s.service };
-    for (const k of ["activity", "agent", "agents", "question", "timeout", "max_attempts", "workflow", "workflows", "channels", "max_turns", "member_positions", "capacity", "size", "input_timeout"]) if (s[k] !== undefined) copy[k] = structuredClone(s[k]);
+    for (const k of ["activity", "agent", "agents", "question", "timeout", "max_attempts", "workflow", "workflows", "channels", "max_turns", "member_positions", "capacity", "size", "input_timeout",
+      "repository", "source_branch", "work_branch", "name", "protected", "rules", "command", "allow_failure"]) if (s[k] !== undefined) copy[k] = structuredClone(s[k]);
     copy.position = { x: s.position.x + 40, y: s.position.y + 40 };
     workflow().steps.push(copy);
     state.selected = id;
@@ -1942,11 +2325,12 @@ const WorkflowLogic = (() => {
   // addStep adds an agent step, or a merge or batch node when one is named.
   function addStep(service = "agent") {
     const w = workflow();
-    const word = L.isNode({ service }) ? service : "step";
+    const word = STEP_WORD[service] || service;
     let n = 1; // the lowest free number, so the first new step is Step 1 whatever the others are called
     while (w.steps.some((s) => sameName(s.id, `${word}-${n}`))) n++;
     const added = { id: `${word}-${n}`, service, position: freeSlot(w, 0) };
-    if (service === "agent" && state.agentRefs[0]) added.agent = state.agentRefs[0];
+    if (["agent", "interactive", "team"].includes(service) && state.agentRefs[0]) added.agent = state.agentRefs[0];
+    if (service === "devpod") podDefaults(added);
     w.steps.push(added);
     state.selected = added.id;
     markDirty();
@@ -2071,7 +2455,7 @@ const WorkflowLogic = (() => {
 
   // A drag on the empty canvas pans it; nodes and arrows keep their own drag and click.
   $("canvas").addEventListener("pointerdown", (ev) => {
-    if (ev.button !== 0 || ev.target.closest?.(".edge, .edge-hit")) return;
+    if (ev.button !== 0 || ev.target.closest?.(".edge, .edge-hit, .back-edge")) return;
     startPan(ev);
   });
   $("canvas").addEventListener("contextmenu", (ev) => openMenu(ev, canvasActions()));
@@ -2083,7 +2467,7 @@ const WorkflowLogic = (() => {
     if (s?.service === "team") { state.teamOpen = { workflow: workflow().name, step: s.id }; state.selected = s.id; render(); }
   });
   // The Service field suggests the kinds this page adds to the list in the page.
-  for (const value of ["workflow", "team", ...L.NODE_KINDS]) {
+  for (const value of ["workflow", "team", ...L.NODE_KINDS, ...L.POD_KINDS]) {
     if (![...$("services").options].some((o) => o.value === value)) $("services").append(h("option", { value }));
   }
   window.addEventListener("pointermove", onPointerMove);
@@ -2099,7 +2483,7 @@ const WorkflowLogic = (() => {
       wanted = { rest: rest.replace(/^\/+/, "") ? rest : last, remembered: !!last };
       const fresh = state.stale;
       state.stale = false;
-      if (fresh) loadAgents();
+      if (fresh) { loadAgents(); loadRepositories(); }
       // Unsaved edits survive a visit to another page: nothing is loaded over them, and a hash
       // that names another workflow or version asks first.
       if (fresh && !state.dirty && !state.saving) { load(); return; }

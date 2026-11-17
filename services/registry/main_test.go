@@ -310,7 +310,7 @@ func TestSeedAgentsCarryUnpackInputs(t *testing.T) {
 		}
 		return validateModelSettings(data)
 	})
-	if err != nil || count != 19 {
+	if err != nil || count != 18 {
 		t.Fatalf("seed agents: %d checked, %v", count, err)
 	}
 }
@@ -319,7 +319,7 @@ func TestSeedAgentsCarryUnpackInputs(t *testing.T) {
 // every policy its prompt includes is a seed policy.
 func TestSeedAgentsAreTheCourseAgents(t *testing.T) {
 	folders, err := filepath.Glob("seed/agents/*/*/v1")
-	if err != nil || len(folders) != 19 {
+	if err != nil || len(folders) != 18 {
 		t.Fatalf("seed agent folders: %d, %v", len(folders), err)
 	}
 	policies := map[string]bool{}
@@ -351,7 +351,7 @@ func TestSeedAgentsAreTheCourseAgents(t *testing.T) {
 			t.Errorf("%s: %d tools with max_retries %d", folder, len(agent.Tools), agent.MaxRetries)
 		}
 		for _, tool := range agent.Tools {
-			if service, _, ok := strings.Cut(tool, "/"); !ok || (service != "factory" && service != "duckduckgo") {
+			if service, _, ok := strings.Cut(tool, "/"); !ok || (service != "factory" && service != "duckduckgo" && service != "devpod") {
 				t.Errorf("%s: tool %q", folder, tool)
 			}
 		}
@@ -405,6 +405,45 @@ func TestCreateValidatesModelSettings(t *testing.T) {
 		"lower bound": `{"unpack_inputs":true,"models":["m"],"temperature":0}`,
 		"upper bound": `{"unpack_inputs":true,"models":["m"],"temperature":2}`,
 		"neither":     `{"unpack_inputs":true,"models":["m"]}`,
+	} {
+		if code, body := post(agentJSON); code != http.StatusCreated {
+			t.Errorf("%s: %d %s", name, code, body)
+		}
+	}
+}
+
+func TestCreateValidatesCommands(t *testing.T) {
+	srv, blobs := newTestRegistry(t, "")
+	post := func(agentJSON string) (int, string) {
+		return call(t, http.MethodPost, srv.URL+"/agents/intake", `{"files":{"systemprompt.md":"x","agent.json":`+agentJSON+`}}`, nil)
+	}
+	for name, commands := range map[string]string{
+		"string":       `"git status"`,
+		"null":         `null`,
+		"object":       `{"a":"git status"}`,
+		"number item":  `["git status", 3]`,
+		"null item":    `["git status", null]`,
+		"empty item":   `["git status", ""]`,
+		"blank item":   `["  "]`,
+		"nested lists": `[["git status"]]`,
+	} {
+		code, body := post(`{"unpack_inputs":true,"models":["m"],"commands":` + commands + `}`)
+		if code != http.StatusUnprocessableEntity || !strings.Contains(body, "agent.json: commands must be a list of non-empty strings, got") {
+			t.Errorf("%s: %d %s", name, code, body)
+		}
+	}
+	if len(blobs.data) != 0 {
+		t.Fatalf("a refused version was stored: %v", blobs.data)
+	}
+	if code, body := post(`{"unpack_inputs":true,"models":["m"],"commands":["./verify.sh","git commit *"]}`); code != http.StatusCreated {
+		t.Fatalf("valid commands: %d %s", code, body)
+	}
+	if stored := string(blobs.data["agents/intake/v1/agent.json"]); !strings.Contains(stored, `"git commit *"`) {
+		t.Fatalf("the commands were not stored as given: %q", stored)
+	}
+	for name, agentJSON := range map[string]string{
+		"empty list": `{"unpack_inputs":true,"models":["m"],"commands":[]}`,
+		"missing":    `{"unpack_inputs":true,"models":["m"]}`,
 	} {
 		if code, body := post(agentJSON); code != http.StatusCreated {
 			t.Errorf("%s: %d %s", name, code, body)

@@ -30,11 +30,23 @@ const NodesQuery = "nodes"
 
 // Item is one result in a step's input or output: the step that produced the artifact, the
 // artifact's object ID, and which run of that step produced it, starting at 1.
+//
+// Kind is set only on the items a rejection adds to the inputs of the step it goes back to:
+// KindRejection for the gate's decision record, KindPrevious for the step's own earlier
+// output, and KindReviewed for a document the person was shown at the gate.
 type Item struct {
 	Source   string `json:"source"`
 	Artifact string `json:"artifact"`
 	Round    int    `json:"round"`
+	Kind     string `json:"kind,omitempty"`
 }
+
+// Kinds of the items a rejection adds to a step's inputs.
+const (
+	KindRejection = "rejection"
+	KindPrevious  = "previous"
+	KindReviewed  = "reviewed"
+)
 
 // IsNode reports whether the step is a merge or batch step.
 func (s Step) IsNode() bool {

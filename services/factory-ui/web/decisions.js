@@ -42,6 +42,22 @@ const DecisionsLogic = {
     return items.map((item) => ({ source: item.source, artifact: item.artifact, round: Math.max(1, Math.floor(Number(item.round)) || 1), repeated: times.get(item.source) > 1 }));
   },
 
+  // publish is the one place that reads a publish decision: a pending entry of
+  // GET /api/orchestrator/decisions (or its stored record) whose step is "<step>.publish-<n>" and
+  // which carries "publish": { step, pod, n, kind: "push" | "pull_request", title, body, repository, branch }.
+  // An agent asked to push its work branch or to open a pull request, and the repository wants
+  // a person to approve that. Returns null for every other decision.
+  publish(d) {
+    const p = d?.publish;
+    if (!p || typeof p !== "object") return null;
+    const word = (value) => (typeof value === "string" ? value : "");
+    const kind = p.kind === "pull_request" ? "pull_request" : "push";
+    return {
+      step: word(p.step) || String(d.step || "").replace(/\.publish-[0-9]+$/, ""), kind, word: kind === "push" ? "Push" : "Pull request",
+      title: word(p.title), body: word(p.body), repository: word(p.repository), branch: word(p.branch),
+    };
+  },
+
   // blocked is the reason Approve and Reject are disabled, "" when they are not.
   blocked(name, documentsLoaded) {
     return !name ? "Needs your name in the top bar" : !documentsLoaded ? "Needs the documents to load" : "";
@@ -281,7 +297,10 @@ const DecisionsLogic = {
     // The gate gets its own line under the question, so the status line stays short, as on Runs.
     // A gate that runs in passes names its pass: a waiting one reports it, a record carries it in its ID (<gate>.pass-<n>).
     const pass = c.kind === "pending" ? c.d.pass || stepPass(c.d.artifact || "").pass : stepPass(TeamsLogic.roundOf(c.id.slice(2)).artifact).pass;
-    const where = state.filter ? stepTitle(c.step, pass) : `${titleCase(c.workflow)} › ${stepTitle(c.step, pass)}`;
+    // A publish decision is named by the step that asked and what it asks for ("Deliver · pull request").
+    const publish = DecisionsLogic.publish(c.kind === "pending" ? c.d : c.rec);
+    const stepName = publish ? `${stepTitle(publish.step, pass)} · ${publish.word.toLowerCase()}` : stepTitle(c.step, pass);
+    const where = state.filter ? stepName : `${titleCase(c.workflow)} › ${stepName}`;
     const gate = h("p", { className: "decision-where", dataset: { full: where } }, where);
     // The round, from the second review on: a waiting gate reports it, a decided record carries it (or its ID does).
     const round = TeamsLogic.roundLabel(c.kind === "pending" ? c.d.round : c.rec.round || TeamsLogic.roundOf(c.id.slice(2)).round);
@@ -321,10 +340,22 @@ const DecisionsLogic = {
       outcome = h("div", { className: "section" }, h("div", { className: "file-head" }, h("h3", { className: "section-title" }, "Comment"), comment.toggle), comment.body);
     }
     const inputs = h("div", { className: "section" }, blocks);
+    // What would be published: the repository and branch, and a pull request's title and text.
+    let publishing = null;
+    if (publish) {
+      const text = publish.body ? docView() : null;
+      text?.setText(publish.body);
+      publishing = h("div", { className: "section decision-publish" },
+        h("div", { className: "file-head" }, h("h3", { className: "section-title" }, publish.word), text?.toggle),
+        h("p", { className: "decision-where" }, [publish.repository, publish.branch].filter(Boolean).join(" · ")),
+        publish.title ? h("p", { className: "pull-request-title" }, publish.title) : null,
+        text?.body);
+    }
     detail.replaceChildren(
       h("div", { className: "panel-head" }),
       h("div", { className: "panel-body" },
         h("div", { className: "section" }, h("h3", { className: "question" }, c.question), gate, meta),
+        publishing,
         inputs,
         outcome));
     earlierRounds(c, (box) => inputs.after(box));

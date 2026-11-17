@@ -105,6 +105,33 @@ func (s HTTPStore) Delete(ctx context.Context, id string) error {
 	return err
 }
 
+// Creator returns the creator recorded for an object, or "" when none is recorded.
+func (s HTTPStore) Creator(ctx context.Context, id string) (string, error) {
+	if !ValidID(id) {
+		return "", fmt.Errorf("invalid object id %q", id)
+	}
+	root := strings.TrimSuffix(s.BaseURL, "/blobs")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, root+"/meta/"+id, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := s.Client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("GET meta %s: %s", id, resp.Status)
+	}
+	var meta struct {
+		Creator string `json:"creator"`
+	}
+	if err = json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		return "", err
+	}
+	return meta.Creator, nil
+}
+
 // TraceObjects lists the IDs of every object stored with the trace ID.
 func (s HTTPStore) TraceObjects(ctx context.Context, traceID string) ([]string, error) {
 	root := strings.TrimSuffix(s.BaseURL, "/blobs")

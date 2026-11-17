@@ -73,6 +73,11 @@ function orchestrator() {
     calls.push({ method, path, body: body === undefined ? undefined : plain(body), headers });
     if (path === "/api/agents/agents") return { entries: [{ name: "demo/coder", versions: ["v1"] }] };
     if (path.startsWith("/api/agents/agents/")) return { files: { "systemprompt.md": "Write code.", "agent.json": { models: ["local"] } } };
+    // The connector service lists the Git repositories as a bare array.
+    if (path === "/api/connectors/git/repositories") return [
+      { name: "claims-build", kind: "plain", url: "http://git-host:8080/claims-build.git", default_branch: "main", setup_command: "", idle_minutes: 30, approve_publish: false, credential: "none" },
+      { name: "site", kind: "github", url: "https://github.com/acme/site.git", default_branch: "trunk", setup_command: "", idle_minutes: 30, approve_publish: true, credential: "read-write" },
+    ];
     const rest = path.replace("/api/orchestrator/workflows", "");
     const [, name, kind, n] = rest.split("/").map(decodeURIComponent);
     if (method === "GET" && !rest) return { workflows: Object.keys(store).map((key) => withList(key, store[key].at(-1))) };
@@ -104,6 +109,7 @@ function page() {
   const ids = new Map(), selectors = new Map();
   const byId = (id) => { if (!ids.has(id)) ids.set(id, new FakeNode("div")); return ids.get(id); };
   const notices = [], questions = [], menus = [], inputs = [];
+  const windowListeners = {}; // the drags on the canvas end on the window
   const storage = new Map();
   const answers = { confirm: true };
   const h = (tag, props = {}, ...children) => {
@@ -122,7 +128,7 @@ function page() {
       querySelector: (selector) => { if (!selectors.has(selector)) selectors.set(selector, new FakeNode("div")); return selectors.get(selector); },
       createElementNS: (_ns, name) => new FakeNode(name), addEventListener() {}, activeElement: null,
     },
-    window: { addEventListener() {} },
+    window: { addEventListener(type, fn) { (windowListeners[type] ||= []).push(fn); } },
     location: { hash: "#workflows" },
     history: { pushState(_s, _t, url) { context.location.hash = url; }, replaceState(_s, _t, url) { context.location.hash = url; } },
     localStorage: { getItem: (key) => (storage.has(key) ? storage.get(key) : null), setItem: (key, value) => storage.set(key, String(value)), removeItem: (key) => storage.delete(key) },
@@ -145,7 +151,9 @@ function page() {
     confirmAction: async (question, action) => { questions.push(`${question} [${action}]`); return answers.confirm; },
     Inputs: { setBlocker(fn) { context.blocker = fn; }, open: (...args) => inputs.push(args) },
   };
-  vm.runInNewContext(`${read("workflowref.js")}\n${read("workflows.js")}`, context);
+  // index.html loads connectors.js before workflows.js; the page needs its logic only.
+  const connectors = read("connectors.js");
+  vm.runInNewContext(`${read("workflowref.js")}\n${connectors.slice(0, connectors.indexOf("// ---- Connectors page ----"))}\n${read("workflows.js")}`, context);
   const head = selectors.get("#tab-workflows .canvas-head");
   const ui = {
     context, server, notices, questions, inputs, answers, byId,
@@ -167,10 +175,35 @@ function page() {
     },
     async run(label, node) { const item = await ui.menu(label, node); assert.ok(!item[4], `${label} is enabled`); await item[1](); await settle(); },
     posts: () => server.calls.filter((c) => c.method !== "GET"),
+    menus,
+    // release ends a drag at a point of the graph (in the graph's own coordinates).
+    async release(x, y) {
+      const [, ox, oy, scale] = /translate\(([-\d.]+),([-\d.]+)\) scale\(([-\d.]+)\)/.exec(find(byId("canvas"), (n) => n.attrs.class === "graph").attrs.transform).map(Number);
+      for (const fn of windowListeners.pointerup || []) fn({ clientX: x * scale + ox, clientY: y * scale + oy });
+      await settle();
+    },
     async open(rest = "") { context.tabs.workflows.show(rest); await settle(); },
   };
   return ui;
 }
+
+test("typed canvas additions have no dependencies or automatically drawn input arrows", async () => {
+  const ui = page();
+  await ui.open("/demo");
+  const inputEdges = () => all(ui.byId("canvas")).filter((n) => (n.attrs.class || "").includes("input-edge")).length;
+  assert.equal(inputEdges(), 1, "saved root receives an input arrow");
+  for (const [label, service] of [["Add agent", "agent"], ["Add human gate", "gate"], ["Add interactive session", "interactive"], ["Add workflow", "workflow"], ["Add team", "team"], ["Add router", "route"], ["Add service", "service"], ["Add merge", "merge"], ["Add batch", "batch"]]) {
+    await ui.run(label);
+    assert.equal(panelField(ui, "service").value, service);
+    assert.equal(inputEdges(), 1, "new draft nodes do not gain input arrows");
+  }
+  await ui.save().onclick();
+  await settle();
+  const added = ui.posts()[0].body.steps.slice(-9);
+  assert.equal(added.length, 9);
+  for (const step of added) assert.equal(step.depends_on, undefined, step.id);
+  assert.equal(inputEdges(), 10, "saved roots show their runtime input connections");
+});
 
 test("the page opens the newest version, lists the versions, and saves nothing by itself", async () => {
   const ui = page();
@@ -193,7 +226,7 @@ test("the page opens the newest version, lists the versions, and saves nothing b
 test("an edit stays unsaved until Save, which stores the next version and shows it", async () => {
   const ui = page();
   await ui.open();
-  await ui.run("Add step");
+  await ui.run("Add agent");
   assert.deepEqual(ui.tiles(), ["plan", "build", "step-1"]);
   assert.equal(ui.save().disabled, false);
   assert.equal(ui.save().title, "Stores the workflow as v4");
@@ -229,7 +262,7 @@ test("an edit stays unsaved until Save, which stores the next version and shows 
 test("a refused save keeps the edits and names the reason", async () => {
   const ui = page();
   await ui.open();
-  await ui.run("Add step");
+  await ui.run("Add agent");
   const real = ui.context.api;
   ui.context.api = async (method, path, ...rest) => {
     if (method === "POST") { const e = new Error('step "step-1" names an agent that does not exist'); e.status = 422; throw e; }
@@ -257,7 +290,7 @@ test("an older version is read-only until edited and is then saved as the next v
   // A run from here uses v2.
   await ui.run("Run workflow…");
   assert.deepEqual(ui.inputs.at(-1), ["demo", 2]);
-  await ui.run("Add step");
+  await ui.run("Add agent");
   assert.equal(ui.note().textContent, "Edited v2: saves as v4");
   assert.equal(ui.save().title, "Stores the workflow as v4");
   await ui.save().onclick();
@@ -284,7 +317,7 @@ test("a reload returns to the version in the hash; one that is gone gives way to
 test("another workflow or version is opened over unsaved edits only after asking", async () => {
   const ui = page();
   await ui.open();
-  await ui.run("Add step");
+  await ui.run("Add agent");
   ui.answers.confirm = false;
   await fire(ui.rows()[1], "click");
   assert.deepEqual(ui.questions, ["Discard your unsaved changes? [Discard]"]);
@@ -365,7 +398,7 @@ test("a new workflow is a draft until its first Save stores v1", async () => {
   await fire(input, "keydown", { key: "Enter" });
   assert.equal(ui.selectedRow(), "Release Notes");
   assert.deepEqual(ui.posts(), []);
-  await ui.run("Add step");
+  await ui.run("Add agent");
   assert.equal(ui.save().disabled, false);
   assert.equal(ui.save().title, "Stores the workflow as v1");
   assert.equal((await ui.menu("Run workflow…"))[4], true, "a draft cannot run");
@@ -602,4 +635,231 @@ test("a step that changes its kind to or from merge and batch drops the fields o
   assert.deepEqual(stored.find((s) => s.id === "a"), { id: "a", service: "batch", position: { x: 0, y: 40 } });
   assert.deepEqual(stored.find((s) => s.id === "gather"), { id: "gather", service: "merge", depends_on: ["b"], input_timeout: 30, position: { x: 268, y: 176 } });
   assert.deepEqual(stored.find((s) => s.id === "collect"), { id: "collect", service: "agent", depends_on: ["a", "b"], position: { x: 0, y: 176 } });
+});
+
+// ---- Dev pod, command and stop nodes, and a gate's back edge (docs/plans/dev-pods.md) ----
+
+// ship adds a workflow that works in a dev pod: pod, build, verify, review, stop, top to bottom.
+function ship(ui) {
+  ui.server.store.ship = [{ name: "ship", version: 1, created: "2026-11-01T10:00:00Z", created_by: "ada", steps: [
+    { id: "pod", service: "devpod", repository: "claims-build", source_branch: "main", work_branch: "agent/pay-{run}", protected: ["tests/**"],
+      rules: [{ tool: "write_file", path: "src/**", matches: "secret", message: "Blocked by R1" }], position: { x: 0, y: 40 } },
+    { id: "build", service: "agent", agent: "demo/coder@v1", depends_on: ["pod"], position: { x: 0, y: 176 } },
+    { id: "verify", service: "command", depends_on: ["build"], command: "./verify.sh", timeout: "5m", position: { x: 0, y: 312 } },
+    { id: "review", service: "gate", depends_on: ["verify"], question: "Good?", position: { x: 0, y: 448 } },
+    { id: "stop", service: "devpod-stop", depends_on: ["review"], position: { x: 0, y: 584 } },
+  ] }];
+}
+const storedStep = (ui, id) => ui.posts().at(-1).body.steps.find((s) => s.id === id);
+const saveNow = async (ui) => { await ui.save().onclick(); await settle(); };
+
+test("a dev pod, a command and a stop step have their own tiles, named by what they do", async () => {
+  const ui = page();
+  ship(ui);
+  await ui.open("/ship/pod");
+  const tile = (id) => find(ui.byId("canvas"), (n) => n.attrs["data-step"] === id);
+  const body = (id) => find(tile(id), (n) => n.attrs.class === "body").attrs.d;
+  const lines = (id) => all(tile(id)).filter((n) => n.tag === "text").map((n) => n.textContent);
+  assert.equal(body("pod"), "M14,0 H206 L220,32 L206,64 H14 L0,32 z", "a hexagon");
+  assert.equal(body("verify"), "M12,0 H220 L208,64 H0 z", "a slanted box");
+  assert.equal(body("stop"), "M0,0 H220 L206,32 L220,64 H0 L14,32 z", "a box notched on each side");
+  assert.equal(new Set(["pod", "build", "verify", "review", "stop"].map(body)).size, 5, "every kind has its own outline");
+  assert.deepEqual(lines("pod"), ["Pod", "claims-build · agent/pay-…"], "the repository and the work branch, cut where the tile ends");
+  assert.equal(find(tile("pod"), (n) => n.tag === "title").textContent, "Pod: claims-build · agent/pay-{run}", "in full on hover");
+  assert.deepEqual(lines("verify"), ["Verify", "./verify.sh"]);
+  assert.deepEqual(lines("stop"), ["Stop", "Deletes the dev pod"]);
+  for (const [id, bar] of [["pod", "bar-devpod"], ["verify", "bar-command"], ["stop", "bar-devpod-stop"]]) assert.ok(find(tile(id), (n) => n.attrs.class === bar), bar);
+  // They keep the ports of every tile; only a gate has the Rejected port.
+  for (const id of ["pod", "verify", "stop"]) assert.equal(all(tile(id)).filter((n) => (n.attrs.class || "").startsWith("port")).length, 2, id);
+  assert.equal(all(tile("review")).filter((n) => n.attrs.class === "port port-reject").length, 1);
+  for (const [id, name] of [["pod", "Dev Pod"], ["verify", "Command"], ["stop", "Stop Dev Pod"]]) {
+    await ui.open(`/ship/${id}`);
+    assert.equal(find(ui.byId("inspector"), (n) => n.tag === "h2").textContent, name);
+  }
+});
+
+test("the node panel of a dev pod has exactly its fields: repository, branches, name, protected paths and rules", async () => {
+  const ui = page();
+  ship(ui);
+  await ui.open("/ship/pod");
+  assert.deepEqual(panelLabels(ui), ["Node ID", "Repository", "Source branch", "Work branch", "Name", "Service", "Protected paths", "Rules", "Tool", "Path", "Matches", "Message"]);
+  assert.deepEqual(panelField(ui, "repository").children.map((o) => o.textContent), ["claims-build", "site"], "filled from the connectors API");
+  assert.equal(panelField(ui, "work_branch").value, "agent/pay-{run}");
+  assert.equal(panelField(ui, "work_branch").placeholder, "agent/{run}", "the default");
+  assert.equal(panelField(ui, "name").placeholder, "No name");
+  assert.match(find(ui.byId("inspector"), (n) => n.tag === "label" && n.textContent === "Name").title, /continues in the live dev pod/);
+  assert.equal(panelField(ui, "protected").value, "tests/**");
+  assert.equal(panelField(ui, "rule-0-tool").children.find((o) => o.selected).textContent, "write_file");
+  assert.equal(panelField(ui, "rule-0-message").value, "Blocked by R1");
+  for (const gone of ["agent", "timeout", "attempts", "question", "activity", "command"]) assert.equal(panelField(ui, gone), undefined, gone);
+  assert.deepEqual(panelProblems(ui), []);
+
+  await change(ui, "name", "claims");
+  await change(ui, "protected", "tests/**\n\n  verify.sh  \n");
+  // A rule is edited field by field; an empty path or pattern is left out.
+  const rule = async (field, value) => { const control = panelField(ui, field); control.value = value; await fire(control, "change"); };
+  await rule("rule-0-path", "");
+  await rule("rule-0-tool", "run_command");
+  await find(ui.byId("inspector"), (n) => n.title === "Add rule").onclick();
+  await settle();
+  assert.deepEqual(panelProblems(ui), ["Rule 2 needs a message that names the rule, the reason and the fix"]);
+  await rule("rule-1-message", "Blocked by R2");
+  await rule("rule-1-matches", "(");
+  assert.deepEqual(panelProblems(ui), ["Rule 2 has a pattern that is not a regular expression"]);
+  await rule("rule-1-matches", "rm -rf");
+  await saveNow(ui);
+  assert.deepEqual(storedStep(ui, "pod"), {
+    id: "pod", service: "devpod", repository: "claims-build", source_branch: "main", work_branch: "agent/pay-{run}", protected: ["tests/**", "verify.sh"],
+    rules: [{ tool: "run_command", matches: "secret", message: "Blocked by R1" }, { tool: "write_file", matches: "rm -rf", message: "Blocked by R2" }],
+    position: { x: 0, y: 40 }, name: "claims",
+  });
+  // Removing every rule and path stores neither.
+  for (const n of [2, 1]) { await find(ui.byId("inspector"), (b) => b.title === `Remove rule ${n}`).onclick(); await settle(); }
+  await change(ui, "protected", "");
+  await saveNow(ui);
+  assert.equal("rules" in storedStep(ui, "pod") || "protected" in storedStep(ui, "pod"), false);
+});
+
+test("a chosen repository brings its default branch, and a new dev pod starts with the default work branch", async () => {
+  const ui = page();
+  await ui.open("/demo");
+  await ui.run("Add dev pod");
+  assert.ok(ui.tiles().includes("dev-pod-1"), "named Dev Pod 1");
+  assert.equal(panelField(ui, "repository").children.find((o) => o.selected).textContent, "claims-build", "the first repository, as a new agent step gets the first agent");
+  assert.equal(panelField(ui, "source_branch").value, "main");
+  assert.equal(panelField(ui, "work_branch").value, "agent/{run}");
+  await change(ui, "source_branch", "");
+  await change(ui, "repository", "site");
+  assert.equal(panelField(ui, "source_branch").value, "trunk", "the repository's default branch");
+  await change(ui, "work_branch", "trunk");
+  assert.deepEqual(panelProblems(ui), ["The work branch must differ from the source branch"]);
+  await change(ui, "work_branch", "");
+  await change(ui, "repository", "");
+  assert.deepEqual(panelProblems(ui), ["A dev pod needs a repository", "A dev pod needs a work branch"]);
+});
+
+test("the node panel of a command has Command, Timeout and Allow failure; a stop step nothing but its ID", async () => {
+  const ui = page();
+  ship(ui);
+  await ui.open("/ship/verify");
+  assert.deepEqual(panelLabels(ui), ["Node ID", "Service", "Timeout", "Allow failure", "Command"]);
+  assert.equal(panelField(ui, "command").value, "./verify.sh");
+  assert.equal(panelField(ui, "timeout").value, "5m");
+  assert.equal(panelField(ui, "allow_failure").checked, false);
+  for (const gone of ["agent", "attempts", "repository", "question"]) assert.equal(panelField(ui, gone), undefined, gone);
+  const box = panelField(ui, "allow_failure");
+  box.checked = true;
+  await fire(find(ui.byId("inspector"), (n) => n.className === "step-form"), "change", { target: box });
+  await change(ui, "command", "python3 -m unittest\n  discover");
+  await saveNow(ui);
+  assert.deepEqual(storedStep(ui, "verify"), { id: "verify", service: "command", depends_on: ["build"], command: "python3 -m unittest discover", timeout: "5m", position: { x: 0, y: 312 }, allow_failure: true });
+  await change(ui, "command", "");
+  assert.deepEqual(panelProblems(ui), ["A command step needs a command"]);
+  await ui.open("/ship/stop");
+  assert.deepEqual(panelLabels(ui), ["Node ID", "Service"]);
+  assert.deepEqual(panelProblems(ui), []);
+});
+
+test("problems of the dev pod steps show in the node panel: a second dev pod, a step that does not come after it", async () => {
+  const ui = page();
+  ship(ui);
+  await ui.open("/ship/pod");
+  await ui.run("Add dev pod");
+  assert.deepEqual(panelProblems(ui), ["A workflow has only one dev pod step, and Pod is another"]);
+  await ui.run("Add command");
+  assert.ok(ui.tiles().includes("command-1"));
+  assert.deepEqual(panelProblems(ui), ["A command step needs a command", "A command step must come after the dev pod step"]);
+  await ui.run("Add stop dev pod");
+  assert.ok(ui.tiles().includes("stop-dev-pod-1"));
+  assert.deepEqual(panelProblems(ui), ["A stop step must come after the dev pod step"]);
+  assert.equal(ui.save().disabled, false, "the orchestrator stays the authority");
+});
+
+test("a step that changes its kind to or from the dev pod kinds drops the fields of the other kind", async () => {
+  const ui = page();
+  ship(ui);
+  await ui.open("/ship/pod");
+  await change(ui, "service", "agent");
+  await ui.open("/ship/build");
+  await change(ui, "timeout", "5m");
+  await change(ui, "service", "command");
+  assert.equal(panelField(ui, "timeout").value, "5m", "the field both kinds have stays");
+  await ui.open("/ship/verify");
+  await change(ui, "service", "devpod-stop");
+  await saveNow(ui);
+  assert.deepEqual(storedStep(ui, "pod"), { id: "pod", service: "agent", position: { x: 0, y: 40 } });
+  assert.deepEqual(storedStep(ui, "build"), { id: "build", service: "command", depends_on: ["pod"], position: { x: 0, y: 176 }, timeout: "5m" });
+  assert.deepEqual(storedStep(ui, "verify"), { id: "verify", service: "devpod-stop", depends_on: ["build"], position: { x: 0, y: 312 } });
+});
+
+test("dragging a gate's Rejected port onto an earlier step sets where its rejections go; a refused drop says why", async () => {
+  const ui = page();
+  ship(ui);
+  await ui.open("/ship/review");
+  const tile = (id) => find(ui.byId("canvas"), (n) => n.attrs["data-step"] === id);
+  const port = () => find(tile("review"), (n) => n.attrs.class === "port port-reject");
+  const backEdges = () => all(ui.byId("canvas")).filter((n) => n.attrs.class === "back-edge-group");
+  const drop = async (x, y) => { port().onpointerdown({ button: 0, stopPropagation() {} }); await ui.release(x, y); };
+  assert.equal(port().attrs.cx, "220", "on the gate's right edge");
+  assert.equal(port().attrs.cy, "20", "below the corner: clear of the output port at the bottom");
+  assert.match(port().children[0].textContent, /^Rejected: /);
+  assert.deepEqual(panelField(ui, "on_reject").children.map((o) => o.textContent), ["Nobody: a rejection ends the run", "Build"]);
+  assert.equal(panelField(ui, "max_rejections"), undefined, "only with a target");
+
+  // The dev pod cannot run again, and Stop comes after the gate.
+  await drop(110, 72);
+  assert.deepEqual(ui.notices.at(-1), { text: "A rejection cannot go back to Pod, a dev pod step", kind: "error" });
+  await drop(110, 616);
+  assert.deepEqual(ui.notices.at(-1), { text: "A rejection cannot go back to Stop, a stop dev pod step", kind: "error" });
+  assert.equal(backEdges().length, 0);
+
+  await drop(110, 208);
+  assert.equal(backEdges().length, 1);
+  const edge = backEdges()[0];
+  assert.equal(edge.children[0].textContent, "A rejection at Review goes back to Build with the reason, its previous result and the reviewed documents, and it runs again with the steps after it; a click removes it");
+  const line = find(edge, (n) => n.attrs.class === "back-edge");
+  assert.equal(line.attrs["marker-end"], "url(#arrow-reject)");
+  assert.equal(line.attrs.d, "M220,468 L240,468 Q248,468 248,460 L248,204 Q248,196 240,196 L229,196", "out of the port, up the channel beside the column, into Build's side");
+  assert.equal(panelField(ui, "on_reject").children.find((o) => o.selected).textContent, "Build");
+  assert.equal(panelField(ui, "max_rejections").placeholder, "5", "the default");
+  assert.deepEqual(panelLabels(ui), ["Node ID", "Service", "Rejections go to", "Max rejections", "Question"]);
+  await change(ui, "max_rejections", "0");
+  assert.deepEqual(panelProblems(ui), ["Max rejections must be a whole number of 1 or more"]);
+  await change(ui, "max_rejections", "3");
+  await saveNow(ui);
+  assert.equal(storedStep(ui, "review").on_reject, "build");
+  assert.equal(storedStep(ui, "review").max_rejections, 3);
+
+  // A click removes the back edge, and Cmd/Ctrl+Z puts it back.
+  await backEdges()[0].onclick();
+  await settle();
+  assert.equal(backEdges().length, 0);
+  assert.equal(ui.notices.at(-1).text, "Removed");
+  ui.context.undo();
+  await settle();
+  assert.equal(backEdges().length, 1);
+  // The panel's select sets it as well; Nobody removes it with its limit.
+  await change(ui, "on_reject", "");
+  await saveNow(ui);
+  assert.equal("on_reject" in storedStep(ui, "review") || "max_rejections" in storedStep(ui, "review"), false);
+});
+
+test("a back edge the orchestrator would refuse stays and shows as a problem, and a renamed target keeps it", async () => {
+  const ui = page();
+  ship(ui);
+  ui.server.store.ship[0].steps[3].on_reject = "build";
+  await ui.open("/ship/build");
+  await change(ui, "id", "Make");
+  await ui.open("/ship/review");
+  assert.equal(panelField(ui, "on_reject").children.find((o) => o.selected).textContent, "Make");
+  // Verify becomes a merge: a rejection cannot go back across it.
+  await ui.open("/ship/verify");
+  await change(ui, "service", "merge");
+  await ui.open("/ship/review");
+  assert.deepEqual(panelProblems(ui), ["A rejection cannot go back across the merge step Verify"]);
+  assert.equal(panelField(ui, "on_reject").children.find((o) => o.selected).textContent, "Make (not allowed)");
+  // A back edge whose target is deleted goes with it.
+  await ui.run("Delete step", find(ui.byId("canvas"), (n) => n.attrs["data-step"] === "make"));
+  await ui.open("/ship/review");
+  assert.deepEqual(panelField(ui, "on_reject").children.map((o) => [o.textContent, !!o.selected]), [["Nobody: a rejection ends the run", false]], "nothing is chosen, so the first option shows");
 });

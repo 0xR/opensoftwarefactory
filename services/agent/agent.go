@@ -33,6 +33,8 @@ type StepRequest struct {
 	Agent          string      `json:"agent,omitempty"`
 	Inputs         []InputItem `json:"inputs"`
 	OutputArtifact string      `json:"output_artifact"`
+	// DevPod is the run's dev pod; empty when the run has none.
+	DevPod string `json:"dev_pod,omitempty"`
 }
 
 // InputItem is one step input: the artifact that a source produced in one of its rounds.
@@ -41,11 +43,17 @@ type InputItem struct {
 	Source   string `json:"source"`
 	Artifact string `json:"artifact"`
 	Round    int    `json:"round"`
+	// Kind marks the items a rejected gate sends back: "rejection" (the gate's decision
+	// record), "previous" (the step's own earlier output) or "reviewed" (a document the person
+	// was shown). A normal input has none.
+	Kind string `json:"kind,omitempty"`
 }
 
 // StepResult is the activity output every service returns.
 type StepResult struct {
 	Artifact string `json:"artifact"`
+	// Blocked is the reason the agent gave with report_blocked; empty when it finished its work.
+	Blocked string `json:"blocked,omitempty"`
 }
 
 // Definition is the agent.json of a pinned agent version.
@@ -62,6 +70,9 @@ type Definition struct {
 	// UnpackInputs is required. With true the first user message holds the content of every
 	// input; with false it lists only the references. It is nil when agent.json lacks it.
 	UnpackInputs *bool `json:"unpack_inputs"`
+	// Commands lists the command patterns the agent may run in a dev pod. The connector service
+	// enforces them; here they are only named in the dev pod note.
+	Commands []string `json:"commands,omitempty"`
 }
 
 // noThinking is the assistant turn that tells a thinking model its thinking is already over.
@@ -69,15 +80,19 @@ type Definition struct {
 // and the model continues with its answer.
 const noThinking = "<think>\n\n</think>\n\n"
 
+// maxAnswerTokens limits one model answer. A small local model sometimes does not stop; without
+// a limit one such answer holds a step until its timeout.
+const maxAnswerTokens = 6000
+
 // chatRequest builds the model request of this agent for the given conversation. With the
 // effort "none" the model is asked not to think first: no reasoning_effort is sent and the
 // conversation ends with an empty thinking block.
 func (d Definition) chatRequest(messages, tools []any) chatRequest {
 	if d.Effort == "none" {
 		ended := append(append(make([]any, 0, len(messages)+1), messages...), map[string]string{"role": "assistant", "content": noThinking})
-		return chatRequest{Model: d.Models[0], Messages: ended, Tools: tools, Temperature: d.Temperature}
+		return chatRequest{Model: d.Models[0], Messages: ended, Tools: tools, Temperature: d.Temperature, MaxTokens: maxAnswerTokens}
 	}
-	return chatRequest{Model: d.Models[0], Messages: messages, Tools: tools, ReasoningEffort: d.Effort, Temperature: d.Temperature}
+	return chatRequest{Model: d.Models[0], Messages: messages, Tools: tools, ReasoningEffort: d.Effort, Temperature: d.Temperature, MaxTokens: maxAnswerTokens}
 }
 
 // RunRecord is stored next to the output artifact as <artifact>.run.json.
@@ -336,6 +351,9 @@ func (s *Service) Process(ctx context.Context, req StepRequest) (result StepResu
 			if errors.Is(retErr, context.Canceled) {
 				record.Status = "canceled"
 			}
+		} else if result.Blocked != "" {
+			record.Status = "blocked"
+			record.Error = result.Blocked
 		} else {
 			record.Status = "completed"
 		}
@@ -363,6 +381,7 @@ func (s *Service) Process(ctx context.Context, req StepRequest) (result StepResu
 	}
 	ref := name + "@" + version
 	ctx = withCorrelation(ctx, req, ref, attempt)
+	ctx = withDevPod(ctx, req.DevPod, ref, req.TraceID)
 	record.Agent = ref
 	meta.Creator = "agent:" + ref
 	log = s.Logger.With("run_id", req.TraceID, "step", req.StepID, "agent", ref,
@@ -442,6 +461,9 @@ func (s *Service) Process(ctx context.Context, req StepRequest) (result StepResu
 	if err != nil {
 		return StepResult{}, err
 	}
+	if strings.TrimSpace(req.DevPod) != "" {
+		user += devPodNote(def.Commands)
+	}
 
 	var tools []any
 	routes := map[string]toolRoute{}
@@ -472,6 +494,7 @@ func (s *Service) Process(ctx context.Context, req StepRequest) (result StepResu
 	calls := 0
 	answer := ""
 	done := false
+	blocked := ""
 	for calls < maxCalls && !done {
 		calls++
 		record.ModelCalls = calls
@@ -575,6 +598,12 @@ func (s *Service) Process(ctx context.Context, req StepRequest) (result StepResu
 			if err := s.checkpointRunRecord(record, req.OutputArtifact, meta, log); err != nil {
 				return StepResult{}, err
 			}
+			// A successful report_blocked ends the work at once: the reason is the output.
+			if reason, ok := blockedReason(ctx); ok {
+				record.Events[len(record.Events)-1].Output = req.OutputArtifact
+				answer, blocked, done = reason, reason, true
+				break
+			}
 		}
 	}
 	if !done {
@@ -597,7 +626,7 @@ func (s *Service) Process(ctx context.Context, req StepRequest) (result StepResu
 	log.Info("agent finished", "model_calls", calls, "artifact", req.OutputArtifact,
 		"estimated_input_tokens", meta.EstimatedInputTokens, "estimated_output_tokens", meta.EstimatedOutputTokens,
 		"estimation_method", meta.EstimationMethod, "processing_time_ms", meta.ProcessingTimeMS)
-	return StepResult{Artifact: req.OutputArtifact}, nil
+	return StepResult{Artifact: req.OutputArtifact, Blocked: blocked}, nil
 }
 
 // checkpointRunRecord makes an in-flight operation and the conversation leading to it durable.
@@ -682,27 +711,58 @@ func (s *Service) loadAgent(ctx context.Context, name, version string) (string, 
 	return entry.Files.Prompt, entry.Files.Definition, nil
 }
 
+// rejectionSentence ends a first message that carries a rejection.
+const rejectionSentence = "Change your previous result so that the rejection no longer applies. Keep what was not criticised."
+
+// rejectionKind reports whether an input item is one a rejected gate sent back.
+func rejectionKind(kind string) bool {
+	return kind == "rejection" || kind == "previous" || kind == "reviewed"
+}
+
 // firstMessage renders the documented first user message. With unpack it loads every input
-// and writes its content. Without it, it lists only the references. Both keep the list order.
+// and writes its content. Without it, it lists only the references. Both keep the list order,
+// with the items a rejected gate sent back after the normal inputs.
 func (s *Service) firstMessage(ctx context.Context, req StepRequest, unpack bool) (string, error) {
 	parts := []string{fmt.Sprintf("Trace: %s\nWorkflow: %s\nStep: %s\nOutput artifact: %s",
 		req.TraceID, req.Workflow, req.StepID, req.OutputArtifact)}
+	var normal, back []InputItem
+	for _, item := range req.Inputs {
+		if rejectionKind(item.Kind) {
+			back = append(back, item)
+		} else {
+			normal = append(normal, item)
+		}
+	}
 	if !unpack {
-		if len(req.Inputs) > 0 {
+		if len(normal) > 0 {
 			lines := []string{"Inputs (read each with get_artifact):"}
-			for _, item := range req.Inputs {
+			for _, item := range normal {
 				lines = append(lines, fmt.Sprintf("- \"%s\" round %d: object %s", item.Source, item.Round, item.Artifact))
 			}
 			parts = append(parts, strings.Join(lines, "\n"))
+		}
+		if len(back) > 0 {
+			lines := []string{"Rejection (read each with get_artifact):"}
+			for _, item := range back {
+				switch item.Kind {
+				case "rejection":
+					lines = append(lines, fmt.Sprintf("- rejection from \"%s\" round %d: object %s", item.Source, item.Round, item.Artifact))
+				case "previous":
+					lines = append(lines, fmt.Sprintf("- your previous result round %d: object %s", item.Round, item.Artifact))
+				default:
+					lines = append(lines, fmt.Sprintf("- reviewed input \"%s\" round %d: object %s", item.Source, item.Round, item.Artifact))
+				}
+			}
+			parts = append(parts, strings.Join(lines, "\n"), rejectionSentence)
 		}
 		return strings.Join(parts, "\n\n"), nil
 	}
 	// The round is written only for a source that appears more than once.
 	perSource := map[string]int{}
-	for _, item := range req.Inputs {
+	for _, item := range normal {
 		perSource[item.Source]++
 	}
-	for _, item := range req.Inputs {
+	for _, item := range normal {
 		data, err := s.Store.Get(ctx, item.Artifact)
 		if err != nil {
 			return "", fmt.Errorf("reading artifact %q: %w", item.Artifact, err)
@@ -713,6 +773,36 @@ func (s *Service) firstMessage(ctx context.Context, req StepRequest, unpack bool
 		}
 		parts = append(parts, fmt.Sprintf("## Input \"%s\"%s (object %s)\n%s", item.Source, round, item.Artifact, data))
 	}
+	for _, item := range back {
+		data, err := s.Store.Get(ctx, item.Artifact)
+		if err != nil {
+			return "", fmt.Errorf("reading artifact %q: %w", item.Artifact, err)
+		}
+		switch item.Kind {
+		case "rejection":
+			// The decision record names the gate and holds the person's reason. A record that
+			// cannot be read as such is shown as it is.
+			gate, reason := item.Source, string(data)
+			var decision struct {
+				Step    string  `json:"step"`
+				Comment *string `json:"comment"`
+			}
+			if json.Unmarshal(data, &decision) == nil && decision.Comment != nil {
+				reason = *decision.Comment
+				if decision.Step != "" {
+					gate = decision.Step
+				}
+			}
+			parts = append(parts, fmt.Sprintf("## Rejection from \"%s\" (round %d)\n%s", gate, item.Round, reason))
+		case "previous":
+			parts = append(parts, fmt.Sprintf("## Your previous result (round %d) (object %s)\n%s", item.Round, item.Artifact, data))
+		default:
+			parts = append(parts, fmt.Sprintf("## Input \"%s\" round %d (object %s)\n%s", item.Source, item.Round, item.Artifact, data))
+		}
+	}
+	if len(back) > 0 {
+		parts = append(parts, rejectionSentence)
+	}
 	return strings.Join(parts, "\n\n"), nil
 }
 
@@ -722,6 +812,7 @@ type configuredTool struct {
 
 type toolRoute struct {
 	client *mcpClient
+	server string // the MCP service the tool belongs to
 	name   string
 }
 
@@ -813,10 +904,13 @@ func (s *Service) discoverTools(ctx context.Context, selected []string, log *slo
 			if len(params) == 0 || string(params) == "null" {
 				params = json.RawMessage(`{"type":"object","properties":{}}`)
 			}
+			if server == devPodService {
+				params = trimDevPodSchema(params)
+			}
 			tools = append(tools, map[string]any{"type": "function", "function": map[string]any{
 				"name": alias, "description": tool.Description, "parameters": params,
 			}})
-			routes[alias] = toolRoute{client: client, name: selection.name}
+			routes[alias] = toolRoute{client: client, server: server, name: selection.name}
 			used = true
 		}
 		if !used {
@@ -855,12 +949,36 @@ func (s *Service) runTool(ctx context.Context, routes map[string]toolRoute, tc t
 	if err := json.Unmarshal(args, &obj); err != nil {
 		return fmt.Sprintf("Error: invalid arguments for tool %q: %v", alias, err), true, nil
 	}
+	devPod := route.server == devPodService
+	pod := devPodOf(ctx)
+	if devPod {
+		// The harness, which knows the run, sets the pod and who is calling, whatever the
+		// model passed. The stored tool call stays as the model wrote it.
+		if pod == nil || pod.pod == "" {
+			return fmt.Sprintf("Error: tool %q works in a dev pod, and this run has none. The workflow needs a devpod step before this step.", alias), true, nil
+		}
+		if obj == nil {
+			obj = map[string]any{}
+		}
+		obj["pod"], obj["agent"], obj["run"] = pod.pod, pod.agent, pod.run
+		data, err := json.Marshal(obj)
+		if err != nil {
+			return "", false, err
+		}
+		args = data
+	}
 	text, isError, err := route.client.callTool(ctx, route.name, args)
 	if err != nil {
 		return "", false, err
 	}
 	if isError {
 		text = "Error: " + text
+	} else if devPod && strings.HasSuffix(route.name, blockedTool) {
+		reason, _ := obj["reason"].(string)
+		if reason = strings.TrimSpace(reason); reason == "" {
+			reason = noBlockedReason
+		}
+		pod.blocked, pod.reason = true, reason
 	}
 	return text, isError, nil
 }

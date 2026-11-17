@@ -78,6 +78,29 @@ func Validate(d Definition) error {
 			if err := validateNode(d.Name, s); err != nil {
 				return err
 			}
+		case DevPodService:
+			if err := validateDevPod(d.Name, s); err != nil {
+				return err
+			}
+		case CommandService:
+			if strings.TrimSpace(s.Command) == "" {
+				return fmt.Errorf("workflow %q: command step %q needs the command it runs", d.Name, s.ID)
+			}
+			if timeout, _ := s.StartToClose(); timeout > MaxCommandTimeout {
+				return fmt.Errorf("workflow %q: command step %q timeout must not be longer than %s", d.Name, s.ID, MaxCommandTimeout)
+			}
+		}
+		if s.Service != DevPodService && (s.Repository != "" || s.SourceBranch != "" || s.WorkBranch != "" || s.Name != "" || len(s.Protected) > 0 || len(s.Rules) > 0) {
+			return fmt.Errorf("workflow %q: step %q sets repository, source_branch, work_branch, name, protected, or rules, which only a devpod step can have", d.Name, s.ID)
+		}
+		if s.Service != CommandService && (s.Command != "" || s.AllowFailure) {
+			return fmt.Errorf("workflow %q: step %q sets command or allow_failure, which only a command step can have", d.Name, s.ID)
+		}
+		if s.MaxRejections != 0 && (s.Service != GateService || s.OnReject == "") {
+			return fmt.Errorf("workflow %q: step %q sets max_rejections, which only a gate step with on_reject can have", d.Name, s.ID)
+		}
+		if s.MaxRejections < 0 {
+			return fmt.Errorf("workflow %q: gate %q max_rejections must be a positive whole number", d.Name, s.ID)
 		}
 		if !s.IsNode() && (s.Capacity != 0 || s.Size != 0 || s.InputTimeout != 0) {
 			return fmt.Errorf("workflow %q: step %q sets capacity, size, or input_timeout, which only a merge or batch step can have", d.Name, s.ID)
@@ -129,21 +152,159 @@ func Validate(d Definition) error {
 			return err
 		}
 	}
+	// A workflow has at most one dev pod. The steps that depend on the devpod step work in it.
+	pod := ""
+	for _, s := range d.Steps {
+		if s.Service != DevPodService {
+			continue
+		}
+		if pod != "" {
+			return fmt.Errorf("workflow %q: steps %q and %q are both devpod steps; a workflow has only one", d.Name, pod, s.ID)
+		}
+		pod = s.ID
+	}
+	inPod := map[string]bool{}
+	if pod != "" {
+		inPod = dependents(d, pod)
+		// A step after a merge or batch runs once per message, which would create the pod again.
+		for _, other := range d.Steps {
+			if other.IsNode() && dependents(d, other.ID)[pod] {
+				return fmt.Errorf("workflow %q: devpod step %q cannot come after the %s step %q", d.Name, pod, other.Service, other.ID)
+			}
+		}
+	}
+	for _, s := range d.Steps {
+		if (s.Service == DevPodStopService || s.Service == CommandService) && !inPod[s.ID] {
+			return fmt.Errorf("workflow %q: %s step %q must depend on the devpod step of the workflow, directly or through other steps", d.Name, s.Service, s.ID)
+		}
+	}
 	for _, s := range d.Steps {
 		if s.OnReject == "" {
 			continue
 		}
-		if target, ok := steps[s.OnReject]; !ok || target.Service != TeamService || s.OnReject == s.ID || !dependents(d, s.OnReject)[s.ID] {
-			return fmt.Errorf("workflow %q: gate %q on_reject must name a team step the gate depends on, not %q", d.Name, s.ID, s.OnReject)
+		target, ok := steps[s.OnReject]
+		if !ok || !target.takesRejections() || s.OnReject == s.ID || !dependents(d, s.OnReject)[s.ID] {
+			return fmt.Errorf("workflow %q: gate %q on_reject must name an agent, interactive, team, or workflow step the gate depends on, not %q", d.Name, s.ID, s.OnReject)
 		}
-		// A rejection runs the steps after the team again. A merge or batch among them would
+		for _, id := range between(d, s.OnReject, s.ID) {
+			if kind := steps[id].Service; kind == DevPodService || kind == DevPodStopService {
+				return fmt.Errorf("workflow %q: gate %q on_reject names %q, but the %s step %q lies between them and cannot run again",
+					d.Name, s.ID, s.OnReject, kind, id)
+			}
+		}
+		// A rejection runs the steps after a team again. A merge or batch among them would
 		// receive their results a second time.
-		after := dependents(d, s.OnReject)
+		if target.Service == TeamService {
+			after := dependents(d, s.OnReject)
+			for _, other := range d.Steps {
+				if after[other.ID] && other.IsNode() {
+					return fmt.Errorf("workflow %q: gate %q on_reject names team %q, which has the %s step %q after it; the gate and its team must both come after it or before it",
+						d.Name, s.ID, s.OnReject, other.Service, other.ID)
+				}
+			}
+			continue
+		}
+		// For another target only the steps between it and the gate run again. A merge or
+		// batch between them, or one that collects their results, would receive a result twice.
+		again := map[string]bool{}
+		for _, id := range between(d, s.OnReject, s.ID) {
+			again[id] = true
+		}
 		for _, other := range d.Steps {
-			if after[other.ID] && other.IsNode() {
-				return fmt.Errorf("workflow %q: gate %q on_reject names team %q, which has the %s step %q after it; the gate and its team must both come after it or before it",
+			if !other.IsNode() {
+				continue
+			}
+			collects := again[other.ID]
+			for _, dep := range other.DependsOn {
+				collects = collects || again[dep]
+			}
+			if collects {
+				return fmt.Errorf("workflow %q: gate %q on_reject names %q, but the %s step %q lies between them or collects a step that runs again; the gate and its target must both come after it or before it",
 					d.Name, s.ID, s.OnReject, other.Service, other.ID)
 			}
+		}
+	}
+	return nil
+}
+
+// takesRejections reports whether a gate may send its rejections back to the step.
+func (s Step) takesRejections() bool {
+	switch s.Service {
+	case AgentService, InteractiveService, TeamService, WorkflowService:
+		return true
+	}
+	return false
+}
+
+// between returns the target of a back edge and every step on a path from it to the gate,
+// without the gate, in definition order. These steps run again after a rejection.
+func between(d Definition, target, gate string) []string {
+	after := dependents(d, target)
+	before := map[string]bool{gate: true}
+	for changed := true; changed; {
+		changed = false
+		for _, s := range d.Steps {
+			if !before[s.ID] {
+				continue
+			}
+			for _, dep := range s.DependsOn {
+				if !before[dep] {
+					before[dep], changed = true, true
+				}
+			}
+		}
+	}
+	var steps []string
+	for _, s := range d.Steps {
+		if s.ID != gate && after[s.ID] && before[s.ID] {
+			steps = append(steps, s.ID)
+		}
+	}
+	return steps
+}
+
+var (
+	repositoryPattern = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]{0,98}[A-Za-z0-9])?$`)
+	branchPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$`)
+)
+
+// validateDevPod checks a devpod step: a repository, a source branch, a work branch that
+// differs from it, and well-formed protected paths and rules.
+func validateDevPod(workflow string, s Step) error {
+	if !repositoryPattern.MatchString(s.Repository) {
+		return fmt.Errorf("workflow %q: devpod step %q needs the repository it clones, such as claims-build", workflow, s.ID)
+	}
+	if !branchPattern.MatchString(s.SourceBranch) {
+		return fmt.Errorf("workflow %q: devpod step %q needs a source_branch such as main", workflow, s.ID)
+	}
+	if !branchPattern.MatchString(strings.ReplaceAll(s.WorkBranch, RunPlaceholder, "run")) {
+		return fmt.Errorf("workflow %q: devpod step %q needs a work_branch such as agent/change-%s", workflow, s.ID, RunPlaceholder)
+	}
+	if s.WorkBranch == s.SourceBranch {
+		return fmt.Errorf("workflow %q: devpod step %q: the work_branch must differ from the source_branch %q", workflow, s.ID, s.SourceBranch)
+	}
+	if s.Name != "" && !repositoryPattern.MatchString(s.Name) {
+		return fmt.Errorf("workflow %q: devpod step %q: name %q must be letters, digits, dots, dashes, and underscores", workflow, s.ID, s.Name)
+	}
+	if s.Agent != "" || len(s.Agents) > 0 || s.Question != "" || s.Activity != "" || s.Workflow != "" || len(s.Workflows) > 0 || len(s.Channels) > 0 || s.MaxTurns != 0 {
+		return fmt.Errorf("workflow %q: devpod step %q takes only repository, source_branch, work_branch, name, protected, rules, depends_on, timeout, and max_attempts", workflow, s.ID)
+	}
+	for _, path := range s.Protected {
+		if strings.TrimSpace(path) == "" {
+			return fmt.Errorf("workflow %q: devpod step %q has an empty protected path", workflow, s.ID)
+		}
+	}
+	for i, rule := range s.Rules {
+		switch rule.Tool {
+		case "write_file", "edit_file", "run_command":
+		default:
+			return fmt.Errorf("workflow %q: devpod step %q rule %d: tool must be write_file, edit_file, or run_command, not %q", workflow, s.ID, i+1, rule.Tool)
+		}
+		if strings.TrimSpace(rule.Message) == "" {
+			return fmt.Errorf("workflow %q: devpod step %q rule %d needs a message that names the rule, the reason, and the fix", workflow, s.ID, i+1)
+		}
+		if _, err := regexp.Compile(rule.Matches); err != nil {
+			return fmt.Errorf("workflow %q: devpod step %q rule %d: matches is not a regular expression: %v", workflow, s.ID, i+1, err)
 		}
 	}
 	return nil

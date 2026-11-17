@@ -1,0 +1,38 @@
+# The connector service creates and deletes dev pods, their token and credential Secrets and
+# their network policies, in the dev pod namespace only. It has no rights anywhere else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: connectors-devpods
+  namespace: opensoftwarefactory-devpods
+  labels:
+    app.kubernetes.io/name: connectors
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, get, list, delete]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create, get, update, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [create, get, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: connectors-devpods
+  namespace: opensoftwarefactory-devpods
+  labels:
+    app.kubernetes.io/name: connectors
+subjects:
+  - kind: ServiceAccount
+    name: connectors
+    namespace: opensoftwarefactory
+roleRef:
+  kind: Role
+  name: connectors-devpods
+  apiGroup: rbac.authorization.k8s.io

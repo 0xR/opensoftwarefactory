@@ -73,7 +73,7 @@ func run() error {
 	w.RegisterActivity(&pipeline.Activities{Store: blobs, LoadDefinitions: func() ([]pipeline.Definition, error) {
 		cfg, err := loadConfig(*configPath)
 		return cfg.Workflows, err
-	}, DescribeAgent: agentDescriber(agents, logger)})
+	}, DescribeAgent: agentDescriber(agents, logger), Connectors: pipeline.NewHTTPConnectorsFromEnv(blobs.Client)})
 	if err = w.Start(); err != nil {
 		return err
 	}
@@ -135,6 +135,13 @@ func (r temporalRunner) Status(ctx context.Context, traceID string) (RunStatus, 
 			st.Nodes, _ = json.Marshal(nodes)
 		}
 	}
+	// How often the steps that ran again after a rejection have run.
+	if value, err := r.c.QueryWorkflow(ctx, traceID, "", pipeline.RoundsQuery); err == nil {
+		var rounds map[string]int
+		if value.Get(&rounds) == nil && len(rounds) > 0 {
+			st.Rounds = rounds
+		}
+	}
 	if st.Status == "Running" {
 		st.DurationMS = max(0, time.Since(st.Started).Milliseconds())
 		st.DurationKnown = true
@@ -150,6 +157,14 @@ func (r temporalRunner) Status(ctx context.Context, traceID string) (RunStatus, 
 		st.Error = err.Error()
 	}
 	st.Artifacts = res.Artifacts
+	if len(res.Rounds) > 0 {
+		st.Rounds = res.Rounds
+	}
+	// A run that an agent ended with report_blocked completed without an error; it is shown
+	// as blocked, with the reason.
+	if res.Blocked != "" && st.Error == "" {
+		st.Status, st.Error = "Blocked", res.Blocked
+	}
 	return st, nil
 }
 

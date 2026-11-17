@@ -28,6 +28,9 @@ const (
 	RunCompleted = "completed"
 	RunFailed    = "failed"
 	RunCancelled = "cancelled"
+	// RunBlocked is the status of a run that an agent ended with report_blocked; the
+	// metadata's error holds the reason.
+	RunBlocked = "blocked"
 )
 
 // MetadataFile is the name of a run's metadata object under its run prefix.
@@ -84,6 +87,9 @@ type Activities struct {
 	// DescribeAgent returns the description of a pinned agent for team.json, or "" when it
 	// is not known. It may be nil.
 	DescribeAgent func(ctx context.Context, ref string) string
+	// Connectors is the connector service, which owns the dev pods. It may be nil for an
+	// orchestrator whose workflows use none.
+	Connectors Connectors
 }
 
 // DecisionRecord is stored as the artifact of a gate step.
@@ -98,10 +104,12 @@ type DecisionRecord struct {
 	DecidedBy string    `json:"decided_by"`
 	DecidedAt time.Time `json:"decided_at"`
 	Artifact  string    `json:"artifact"`
-	// OnReject and Round are set for a gate with on_reject: the team step a rejection goes
+	// OnReject and Round are set for a gate with on_reject: the step a rejection goes
 	// back to and the review round this decision belongs to.
 	OnReject string `json:"on_reject,omitempty"`
 	Round    int    `json:"round,omitempty"`
+	// Publish is set for a decision about a publish request of a dev pod.
+	Publish *PublishInfo `json:"publish,omitempty"`
 }
 
 // RecordDecision stores a gate decision as the gate step's artifact, with
@@ -203,10 +211,26 @@ func (a *Activities) ResolveRoute(ctx context.Context, req RouteRequest) (RouteR
 const sessionCreator = "orchestrator"
 
 // OpenSessionRequest names the session of an interactive step and the artifacts it starts with.
+// DevPod is the ID of the run's dev pod, empty when the run has none. Rejection is set when
+// the step runs again because a gate sent its rejection back to it.
 type OpenSessionRequest struct {
+	TraceID   string         `json:"trace_id"`
+	Session   string         `json:"session"`
+	Inputs    []Item         `json:"inputs"`
+	DevPod    string         `json:"dev_pod,omitempty"`
+	Rejection *TeamRejection `json:"rejection,omitempty"`
+}
+
+// SessionRecord is stored as <session>/session.json for a session whose run has a dev pod,
+// so the agent service knows which pod the chat works in.
+type SessionRecord struct {
 	TraceID string `json:"trace_id"`
-	Session string `json:"session"`
-	Inputs  []Item `json:"inputs"`
+	DevPod  string `json:"dev_pod"`
+}
+
+// RejectionFile names the session file that holds the n-th rejection of a gate.
+func RejectionFile(round int) string {
+	return fmt.Sprintf("rejection-%d.md", round)
 }
 
 // inputFile names the file the i-th input is copied to: input-<source>, with the round
@@ -244,14 +268,30 @@ func (a *Activities) OpenSession(ctx context.Context, req OpenSessionRequest) (O
 		}
 	}
 	res := OpenSessionResult{Files: []string{}}
+	meta := Meta{Creator: sessionCreator, TraceID: req.TraceID}
+	if req.DevPod != "" {
+		if err := a.putJSON(ctx, req.Session+"/session.json", SessionRecord{TraceID: req.TraceID, DevPod: req.DevPod}, meta); err != nil {
+			return res, err
+		}
+	}
 	for i, item := range req.Inputs {
+		// The rejection a gate sent back is a file of its own, not the gate's decision record.
+		if r := req.Rejection; r != nil && item.Source == r.Gate && item.Round == r.Round {
+			name := RejectionFile(r.Round)
+			text := fmt.Sprintf("# Rejection from %q (round %d)\n\nRejected by: %s\n\n%s\n", r.Gate, r.Round, r.DecidedBy, strings.TrimSpace(r.Reason))
+			if err := a.Store.Put(ctx, req.Session+"/files/"+name, []byte(text), meta); err != nil {
+				return res, fmt.Errorf("writing session file %q: %w", name, err)
+			}
+			res.Files = append(res.Files, name)
+			continue
+		}
 		data, err := a.Store.Get(ctx, item.Artifact)
 		if err != nil {
 			return res, fmt.Errorf("reading artifact %q: %w", item.Artifact, err)
 		}
 		name := inputFile(req.Inputs, i, data)
 		id := req.Session + "/files/" + name
-		if err = a.Store.Put(ctx, id, data, Meta{Creator: sessionCreator, TraceID: req.TraceID}); err != nil {
+		if err = a.Store.Put(ctx, id, data, meta); err != nil {
 			return res, fmt.Errorf("writing session file %q: %w", id, err)
 		}
 		res.Files = append(res.Files, name)

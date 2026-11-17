@@ -375,8 +375,8 @@ func TestConfigTemplateIsValid(t *testing.T) {
 	// One workflow per course exercise, with its number of steps.
 	want := map[string]int{
 		"ex01-team-standing": 2, "ex02-research-workflow": 6, "ex03-system-design": 3,
-		"ex04-intake-triage": 3, "ex05-architecture-review": 2, "ex06-implementation": 3,
-		"ex07-guardrails": 3, "ex08-pr-review": 5, "ex09-trust-runs": 3,
+		"ex04-intake-triage": 3, "ex05-architecture-review": 2, "ex06-implementation": 6,
+		"ex07-guardrails": 7, "ex08-pr-review": 7, "ex09-trust-runs": 3,
 	}
 	if len(c.Workflows) != len(want) {
 		t.Fatalf("template has %d workflows, want %d", len(c.Workflows), len(want))
@@ -392,7 +392,8 @@ func TestConfigTemplateIsValid(t *testing.T) {
 }
 
 // Every agent a seeded workflow names is a seed agent of the registry, every agent step
-// has the 10 minute timeout, and no two steps of a workflow share a place in the editor.
+// has a timeout of 10 minutes, or 15 or 20 for an agent that works in a dev pod, and no two
+// steps of a workflow share a place in the editor.
 func TestConfigTemplateStepsNameSeedAgents(t *testing.T) {
 	c, err := loadConfig("config.template")
 	if err != nil {
@@ -421,7 +422,7 @@ func TestConfigTemplateStepsNameSeedAgents(t *testing.T) {
 				t.Errorf("%s/%s: agent %q is not a pinned course agent", w.Name, s.ID, s.Agent)
 				continue
 			}
-			if s.Service == pipeline.AgentService && s.Timeout != "10m" {
+			if s.Service == pipeline.AgentService && s.Timeout != "10m" && s.Timeout != "15m" && s.Timeout != "20m" {
 				t.Errorf("%s/%s: timeout %q", w.Name, s.ID, s.Timeout)
 			}
 			seed := filepath.Join("..", "registry", "seed", "agents", filepath.FromSlash(name), version)
@@ -432,8 +433,8 @@ func TestConfigTemplateStepsNameSeedAgents(t *testing.T) {
 			}
 		}
 	}
-	if agents != 20 {
-		t.Errorf("the template names %d agents, want 20", agents)
+	if agents != 19 {
+		t.Errorf("the template names %d agents, want 19", agents)
 	}
 }
 
@@ -460,11 +461,25 @@ func TestConfigTemplateSeedsTheParallelExercises(t *testing.T) {
 	if s := research.Steps[5]; s.Service != pipeline.GateService || s.Question != "Is the research report good enough to use? A rejection needs a reason." {
 		t.Errorf("gate step %+v", s)
 	}
-	if s := review.Steps[2]; s.Service != pipeline.MergeService || strings.Join(s.DependsOn, ",") != "spec-review,qa-review" || s.InputTimeout != 1800 {
+	// The two review agents and the test command work side by side in the dev pod.
+	if s := review.Steps[0]; s.Service != pipeline.DevPodService || s.Repository != "claims-review" || len(s.DependsOn) != 0 {
+		t.Errorf("pod step %+v", s)
+	}
+	if a, b := review.Steps[1], review.Steps[2]; strings.Join(a.DependsOn, ",") != "pod" || strings.Join(b.DependsOn, ",") != "pod" || a.Agent != "course/spec-agent@v1" || b.Agent != "course/qa-agent@v1" {
+		t.Errorf("review steps %+v %+v", a, b)
+	}
+	if s := review.Steps[3]; s.Service != pipeline.CommandService || strings.Join(s.DependsOn, ",") != "pod" || !s.AllowFailure {
+		t.Errorf("tests step %+v", s)
+	}
+	if s := review.Steps[4]; s.Service != pipeline.MergeService || strings.Join(s.DependsOn, ",") != "spec-review,qa-review,tests" || s.InputTimeout != 1800 {
 		t.Errorf("merge step %+v", s)
 	}
-	if a, b := review.Steps[0], review.Steps[1]; len(a.DependsOn) != 0 || len(b.DependsOn) != 0 || a.Agent != "course/spec-agent@v1" || b.Agent != "course/qa-agent@v1" {
-		t.Errorf("review steps %+v %+v", a, b)
+	// A rejection at either gate goes back to the step that wrote what was reviewed.
+	if s := research.Steps[5]; s.OnReject != "report" {
+		t.Errorf("research gate %+v", s)
+	}
+	if s := review.Steps[6]; s.Service != pipeline.GateService || s.OnReject != "dossier" {
+		t.Errorf("review gate %+v", s)
 	}
 }
 

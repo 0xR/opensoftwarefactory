@@ -12,7 +12,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any
 
-from factory import NotFoundError, blobstore, policies, valid_id
+from factory import NotFoundError, blobstore, connectors, policies, valid_id
 
 SEARCH_SECONDS = 5.0
 
@@ -370,6 +370,232 @@ def finish_team(team: str, member: str, files: list[str], summary: str) -> str:
     finished = {"summary": summary, "files": files, "finished_at": _now()}
     blobstore.put(f"{team}/finished.json", json.dumps(finished), "tool-gateway", info.get("trace_id", ""))
     return f"Team finished. Result files: {', '.join(files)}."
+
+
+# The dev pod tools. A dev pod is a Linux sandbox that holds a clone of a Git repository in
+# /workspace, on a work branch of its own. Every tool forwards to the connector service,
+# which checks the call against the rules of the pod and of the agent. The first three
+# arguments (pod, agent, run) are filled in by the system on every call; whatever a model
+# passes for them is replaced.
+
+
+def list_files(pod: str, agent: str, run: str, path: str = ".") -> dict:
+    """List the files and folders in one folder of the repository you work on.
+
+    pod, agent and run are filled in by the system; do not pass them.
+    path is a folder relative to the repository root, for example "src" or
+    "src/panel". Leave it out to list the root. One level is listed, not the
+    folders below it; call list_files again with a sub-folder to go deeper.
+    Returns {"path", "entries": [{"name", "type": "file" or "dir", "size"}],
+    "truncated"}. Fails with a message if the folder does not exist.
+    Example: list_files(path="src").
+    """
+    return _devpod(pod, agent, run, "list_files", {"path": path or "."})
+
+
+def read_file(pod: str, agent: str, run: str, path: str, start_line: int = 0, end_line: int = 0) -> str:
+    """Return the text of a file of the repository you work on.
+
+    pod, agent and run are filled in by the system; do not pass them.
+    path is the file relative to the repository root, for example
+    "src/panel.py". start_line and end_line select an inclusive range of lines,
+    counted from 1: start_line=10, end_line=20 returns lines 10 to 20. 0 means
+    open, so leaving both at 0 returns the whole file. The text is returned
+    exactly as it is in the file, without line numbers, so you can copy from it
+    into edit_file. A very long file is cut, with a note at the end that says
+    how to read the rest. Fails with a message if the file does not exist.
+    Example: read_file(path="src/panel.py").
+    """
+    args: dict[str, Any] = {"path": path}
+    if start_line:
+        args["start_line"] = start_line
+    if end_line:
+        args["end_line"] = end_line
+    result = _devpod(pod, agent, run, "read_file", args)
+    if not isinstance(result, dict):
+        return str(result)
+    content = result.get("content", "")
+    if not content and not result.get("total_lines"):
+        return f"{result.get('path', path)} is empty."
+    if result.get("note"):
+        content = f"{content}\n[{result['note']}]"
+    return content
+
+
+def write_file(pod: str, agent: str, run: str, path: str, content: str) -> dict:
+    """Write a whole file in the repository you work on, creating it or replacing its content.
+
+    pod, agent and run are filled in by the system; do not pass them.
+    path is the file relative to the repository root, for example
+    "src/panel.py"; missing folders are created. content is the complete new
+    text of the file: everything that was in the file before is gone, so to
+    change a part of a file use edit_file instead.
+    Returns {"path", "created", "bytes"}. The call is refused with a message
+    when the file is protected or a rule of this work forbids the content; the
+    message says why and what to do instead. Do not try the same change in
+    another way.
+    Example: write_file(path="notes/plan.md", content="# Plan\\n").
+    """
+    return _devpod(pod, agent, run, "write_file", {"path": path, "content": content})
+
+
+def edit_file(pod: str, agent: str, run: str, path: str, old_text: str, new_text: str) -> dict:
+    """Replace one piece of text in a file of the repository you work on.
+
+    pod, agent and run are filled in by the system; do not pass them.
+    path is the file relative to the repository root. old_text is the exact
+    text to replace, copied from read_file including spaces and line breaks; it
+    must occur exactly once in the file. new_text is what stands there
+    afterwards. If old_text is not found or occurs several times, nothing is
+    changed and a message says so: read the file again and pass a longer
+    old_text that matches one place.
+    Returns {"path", "replaced": 1}. The call is refused with a message when
+    the file is protected or a rule of this work forbids the new text; the
+    message says why and what to do instead.
+    Example: edit_file(path="src/panel.py", old_text="total = 0", new_text="total = 1").
+    """
+    return _devpod(pod, agent, run, "edit_file", {"path": path, "old_text": old_text, "new_text": new_text})
+
+
+def search(pod: str, agent: str, run: str, pattern: str, path: str = "") -> dict:
+    """Search the files of the repository you work on for a regular expression.
+
+    pod, agent and run are filled in by the system; do not pass them.
+    pattern is a regular expression, for example "def render" or
+    "payment_date". path limits the search to one folder or file, for example
+    "src"; leave it out to search the whole repository.
+    Returns {"matches": [{"path", "line", "text"}], "truncated"} with at most
+    100 matches; line is the line number, counted from 1. No match gives an
+    empty list.
+    Example: search(pattern="payment_date", path="src").
+    """
+    args = {"pattern": pattern}
+    if path:
+        args["path"] = path
+    return _devpod(pod, agent, run, "search", args)
+
+
+def run_command(pod: str, agent: str, run: str, command: str, timeout_seconds: int = 0) -> dict:
+    """Run one shell command in the root of the repository you work on.
+
+    pod, agent and run are filled in by the system; do not pass them.
+    command is one command, for example "./verify.sh", "git status" or
+    "git commit -m 'Add payment date'". Only the commands your instructions
+    allow can be run; any other command is refused with a message that lists
+    the allowed ones. Run one command per call: a command that joins several
+    with ";", "&&", "||" or "|" is refused. Git is used through this tool: to
+    save your work run "git add <files>" and then "git commit -m '<message>'".
+    timeout_seconds is the time limit; 0 means the default of 120 seconds, the
+    most is 600.
+    Returns {"exit_code", "stdout", "stderr"}. exit_code 0 means the command
+    succeeded; any other value means it failed, and stdout and stderr say why.
+    Example: run_command(command="python3 -m unittest discover").
+    """
+    args: dict[str, Any] = {"command": command}
+    if timeout_seconds:
+        args["timeout_seconds"] = timeout_seconds
+    return _devpod(pod, agent, run, "run_command", args)
+
+
+def report_blocked(pod: str, agent: str, run: str, reason: str) -> str:
+    """Say that you cannot finish the work, and end it as blocked.
+
+    pod, agent and run are filled in by the system; do not pass them.
+    Call this when something you may not change stops the work: a tool call
+    was refused and the task cannot be done without it, a needed service is
+    down, or the task contradicts a rule. Do not work around the obstacle.
+    reason says in one or two sentences what stops the work and what would be
+    needed to continue.
+    After this call your work ends; do not call any more tools.
+    Example: report_blocked(reason="The test service is down, so the checks cannot run.").
+    """
+    return _devpod_text(_devpod(pod, agent, run, "report_blocked", {"reason": reason}))
+
+
+def push_branch(pod: str, agent: str, run: str) -> str:
+    """Publish your commits: push the work branch to the Git host of the repository.
+
+    pod, agent and run are filled in by the system; do not pass them.
+    It takes no arguments of your own; the branch is always the work branch
+    of this work. Commit first (run_command with "git add" and "git commit");
+    only committed changes are pushed.
+    Returns what happened. If the answer is "Recorded. A person must approve
+    before this is published.", the push happens after a person approved it:
+    you are done and need not call push_branch again. Fails with a message
+    when the repository cannot be written to.
+    Example: push_branch().
+    """
+    return _devpod_text(_devpod(pod, agent, run, "push_branch", {}))
+
+
+def create_pull_request(pod: str, agent: str, run: str, title: str, body: str) -> str:
+    """Create the pull request that offers your commits on the work branch for review.
+
+    pod, agent and run are filled in by the system; do not pass them.
+    title is one short line that says what the change does. body is the
+    description in Markdown: what changed, why, and how it was checked.
+    Commit your changes first. There is one pull request per work; if it
+    exists already the call is refused, and you change it with
+    update_pull_request.
+    Returns what was created. If the answer is "Recorded. A person must
+    approve before this is published.", the pull request is created after a
+    person approved it: you are done.
+    Example: create_pull_request(title="Show the payment date",
+    body="Adds the payment date to the panel. Checked with ./verify.sh.").
+    """
+    return _devpod_text(_devpod(pod, agent, run, "create_pull_request", {"title": title, "body": body}))
+
+
+def update_pull_request(pod: str, agent: str, run: str, title: str = "", body: str = "") -> str:
+    """Change the title or the description of the pull request of your work.
+
+    pod, agent and run are filled in by the system; do not pass them.
+    Pass the new title, the new body, or both; what you leave out stays as it
+    is. New commits on the work branch are picked up as well. Fails with a
+    message if there is no pull request yet.
+    Example: update_pull_request(body="Adds the payment date. Checked with ./verify.sh.").
+    """
+    args = {}
+    if title:
+        args["title"] = title
+    if body:
+        args["body"] = body
+    return _devpod_text(_devpod(pod, agent, run, "update_pull_request", args))
+
+
+def get_pull_request(pod: str, agent: str, run: str) -> str:
+    """Return the pull request of your work: title, description, branches and comments.
+
+    pod, agent and run are filled in by the system; do not pass them.
+    It takes no arguments of your own. Fails with a message if there is no
+    pull request yet.
+    Example: get_pull_request().
+    """
+    return _devpod_text(_devpod(pod, agent, run, "get_pull_request", {}))
+
+
+def comment_on_pull_request(pod: str, agent: str, run: str, body: str) -> str:
+    """Add a comment to the pull request of your work.
+
+    pod, agent and run are filled in by the system; do not pass them.
+    body is the text of the comment in Markdown, for example a review finding
+    or a note on what was checked. Fails with a message if there is no pull
+    request yet.
+    Example: comment_on_pull_request(body="All checks pass.").
+    """
+    return _devpod_text(_devpod(pod, agent, run, "comment_on_pull_request", {"body": body}))
+
+
+def _devpod(pod: str, agent: str, run: str, tool: str, args: dict[str, Any]) -> Any:
+    """Forward a dev pod tool call to the connector service; a refusal is raised with its message."""
+    return connectors.tool(pod, tool, args, agent, run)
+
+
+def _devpod_text(result: Any) -> str:
+    """Return a result as text: a sentence as it is, anything else as JSON."""
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, indent=1, ensure_ascii=False)
 
 
 def _now() -> str:

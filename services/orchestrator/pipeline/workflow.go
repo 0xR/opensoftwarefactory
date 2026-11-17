@@ -66,11 +66,29 @@ type Step struct {
 	// MemberPositions keeps where the editor shows the members of a team step, by member name:
 	// x in percent of the panel width, y in pixels. It has no effect on a run.
 	MemberPositions map[string]Point `yaml:"member_positions,omitempty" json:"member_positions,omitempty"`
-	// OnReject names the team step a gate sends its rejections back to.
-	OnReject    string   `yaml:"on_reject,omitempty" json:"on_reject,omitempty"`
-	DependsOn   []string `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
-	Timeout     string   `yaml:"timeout,omitempty" json:"timeout,omitempty"`
-	MaxAttempts int32    `yaml:"max_attempts,omitempty" json:"max_attempts,omitempty"`
+	// OnReject names the agent, interactive, team, or workflow step a gate sends its
+	// rejections back to; that step and the steps between it and the gate then run again.
+	// MaxRejections is the number of rejections the gate sends back, DefaultMaxRejections
+	// when it is 0; a rejection beyond it ends the run.
+	OnReject      string `yaml:"on_reject,omitempty" json:"on_reject,omitempty"`
+	MaxRejections int    `yaml:"max_rejections,omitempty" json:"max_rejections,omitempty"`
+	// Repository, SourceBranch, WorkBranch, Name, Protected, and Rules configure a devpod
+	// step. The work branch may hold {run}, the first eight characters of the run ID. A name
+	// reuses the live pod of the same repository and name. The agents cannot change the
+	// protected paths, and a rule blocks a tool call with a message.
+	Repository   string   `yaml:"repository,omitempty" json:"repository,omitempty"`
+	SourceBranch string   `yaml:"source_branch,omitempty" json:"source_branch,omitempty"`
+	WorkBranch   string   `yaml:"work_branch,omitempty" json:"work_branch,omitempty"`
+	Name         string   `yaml:"name,omitempty" json:"name,omitempty"`
+	Protected    []string `yaml:"protected,omitempty" json:"protected,omitempty"`
+	Rules        []Rule   `yaml:"rules,omitempty" json:"rules,omitempty"`
+	// Command and AllowFailure configure a command step: the command it runs in the run's
+	// dev pod, and whether an exit code other than 0 lets the run go on.
+	Command      string   `yaml:"command,omitempty" json:"command,omitempty"`
+	AllowFailure bool     `yaml:"allow_failure,omitempty" json:"allow_failure,omitempty"`
+	DependsOn    []string `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
+	Timeout      string   `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	MaxAttempts  int32    `yaml:"max_attempts,omitempty" json:"max_attempts,omitempty"`
 	// Capacity, Size, and InputTimeout configure merge and batch steps: the waiting entries a
 	// merge may hold, the items a batch collects, and the seconds either waits for input.
 	Capacity     int    `yaml:"capacity,omitempty" json:"capacity,omitempty"`
@@ -112,19 +130,29 @@ type Input struct {
 	// Run changes whenever the step that started this run runs again after a rejection, so
 	// the teams inside can tell that from a retry.
 	Run string `json:"run,omitempty"`
+	// DevPod is the dev pod of the run that started this one; every step of a nested run
+	// works in it. It is nil for a top-level run, whose pod a devpod step creates.
+	DevPod *DevPod `json:"dev_pod,omitempty"`
 }
 
 // Result maps every step ID to the artifact it produced. Steps of a routed
 // workflow appear as "<route step>/<step>". For a step after a merge or batch
 // it holds the artifact of the newest pass. Final holds every item the single
-// final step of the definition produced, in order.
+// final step of the definition produced, in order. Blocked holds the reason when an
+// agent ended its work with report_blocked, and BlockedStep the step it ran in; the
+// steps after it did not run. Rounds counts the runs of every step that ran again
+// after a rejection; the earlier runs are kept as <step>.round-<n>.
 type Result struct {
-	TraceID   string            `json:"trace_id"`
-	Artifacts map[string]string `json:"artifacts"`
-	Final     []Item            `json:"final,omitempty"`
+	TraceID     string            `json:"trace_id"`
+	Artifacts   map[string]string `json:"artifacts"`
+	Final       []Item            `json:"final,omitempty"`
+	Blocked     string            `json:"blocked,omitempty"`
+	BlockedStep string            `json:"blocked_step,omitempty"`
+	Rounds      map[string]int    `json:"rounds,omitempty"`
 }
 
-// StepRequest is the activity input every service receives.
+// StepRequest is the activity input every service receives. DevPod is the ID of the run's
+// dev pod, empty when the step works without one.
 type StepRequest struct {
 	TraceID        string `json:"trace_id"`
 	Workflow       string `json:"workflow"`
@@ -132,12 +160,15 @@ type StepRequest struct {
 	Agent          string `json:"agent,omitempty"`
 	Inputs         []Item `json:"inputs"`
 	OutputArtifact string `json:"output_artifact"`
+	DevPod         string `json:"dev_pod,omitempty"`
 }
 
 // StepResult is the activity output every service returns: the artifact the step wrote. The
-// pipeline turns it into the step's item.
+// pipeline turns it into the step's item. Blocked holds the reason when the agent ended its
+// work with report_blocked; the run then ends as blocked.
 type StepResult struct {
 	Artifact string `json:"artifact"`
+	Blocked  string `json:"blocked,omitempty"`
 }
 
 // items returns the result as a list: one item, or none when the step named no artifact.
@@ -168,12 +199,17 @@ type PendingGate struct {
 	Question string `json:"question,omitempty"`
 	Inputs   []Item `json:"inputs"`
 	Artifact string `json:"artifact"`
-	// OnReject is the team step a rejection goes back to, empty for a plain gate. Round is 1
+	// OnReject is the step a rejection goes back to, empty for a plain gate. Round is 1
 	// for the first review and grows with every rejection sent back.
 	OnReject string `json:"on_reject"`
 	Round    int    `json:"round"`
 	// Pass is the pass of a gate that runs after a merge or batch.
 	Pass int `json:"pass,omitempty"`
+	// MaxRejections is the number of rejections a gate with on_reject sends back.
+	MaxRejections int `json:"max_rejections,omitempty"`
+	// Publish is set for a decision about a publish request of a dev pod instead of a gate
+	// step: Step is then "<step>.publish-<n>", and a rejection does not end the run.
+	Publish *PublishInfo `json:"publish,omitempty"`
 }
 
 // PendingSession describes an interactive step whose chat session waits to be completed.
@@ -188,7 +224,13 @@ type PendingSession struct {
 	Session  string   `json:"session"`
 	// Pass is the pass of a session that runs after a merge or batch.
 	Pass int `json:"pass,omitempty"`
+	// DevPod is the ID of the run's dev pod, left out when the session works without one.
+	DevPod string `json:"dev_pod,omitempty"`
 }
+
+// RoundsQuery is the Temporal query that returns how often every step that ran again after
+// a rejection has run.
+const RoundsQuery = "rounds"
 
 // Completion is what a person sends to a waiting interactive step: the session file that
 // becomes the step's output.
@@ -250,6 +292,9 @@ func (s Step) StartToClose() (time.Duration, error) {
 		if s.Service == "agent" {
 			return 2 * time.Minute, nil
 		}
+		if s.Service == CommandService {
+			return DefaultCommandTimeout, nil
+		}
 		return 10 * time.Minute, nil
 	}
 	d, err := time.ParseDuration(s.Timeout)
@@ -267,17 +312,38 @@ func (s Step) StartToClose() (time.Duration, error) {
 // and forward them as one message; the steps after them run once per message.
 // A top-level run records how it ended in its metadata.
 func Pipeline(ctx workflow.Context, in Input) (Result, error) {
-	res, err := runPipeline(ctx, in)
+	var held *DevPod
+	res, err := runPipeline(ctx, in, &held)
+	if held != nil {
+		releasePod(ctx, in, held)
+	}
 	if in.Depth == 0 {
-		finishRun(ctx, in, err)
+		finishRun(ctx, in, res, err)
 	}
 	return res, err
+}
+
+// releasePod tells the connector service that the run which created the dev pod is over. It
+// uses a disconnected context, so it also runs when the run failed or was cancelled. A
+// failure to release does not change the result of the run.
+func releasePod(ctx workflow.Context, in Input, pod *DevPod) {
+	dctx, cancel := workflow.NewDisconnectedContext(ctx)
+	defer cancel()
+	dctx = workflow.WithActivityOptions(dctx, workflow.ActivityOptions{
+		TaskQueue:           TaskQueue,
+		StartToCloseTimeout: time.Minute,
+		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 3},
+	})
+	release := ReleaseDevPodRequest{Pod: pod.ID, Run: in.TraceID}
+	if err := workflow.ExecuteActivity(dctx, ReleaseDevPodActivity, release).Get(dctx, nil); err != nil {
+		workflow.GetLogger(ctx).Warn("releasing the dev pod failed", "trace_id", in.TraceID, "pod", pod.ID, "error", err)
+	}
 }
 
 // finishRun records the end of a top-level run in its metadata. It uses a disconnected
 // context, so it also runs when the run was cancelled. A failure to record does not change
 // the result of the run.
-func finishRun(ctx workflow.Context, in Input, runErr error) {
+func finishRun(ctx workflow.Context, in Input, res Result, runErr error) {
 	prefix := in.Prefix
 	if prefix == "" {
 		prefix = RunPrefix(in.TraceID)
@@ -288,6 +354,9 @@ func finishRun(ctx workflow.Context, in Input, runErr error) {
 		if temporal.IsCanceledError(runErr) || ctx.Err() != nil {
 			req.Status = RunCancelled
 		}
+	} else if res.Blocked != "" {
+		// An agent ended its work with report_blocked: the run is blocked, not failed.
+		req.Status, req.Error = RunBlocked, res.Blocked
 	}
 	dctx, cancel := workflow.NewDisconnectedContext(ctx)
 	defer cancel()
@@ -301,8 +370,9 @@ func finishRun(ctx workflow.Context, in Input, runErr error) {
 	}
 }
 
-// runPipeline executes the steps of the definition.
-func runPipeline(ctx workflow.Context, in Input) (Result, error) {
+// runPipeline executes the steps of the definition. It sets held to the dev pod a devpod
+// step of this run created, which the caller releases when the run ends.
+func runPipeline(ctx workflow.Context, in Input, held **DevPod) (Result, error) {
 	if err := Validate(in.Definition); err != nil {
 		return Result{}, temporal.NewNonRetryableApplicationError(err.Error(), "InvalidDefinition", nil)
 	}
@@ -349,6 +419,41 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 	// dropped, and the step then runs again. cancels stops the child workflows in flight.
 	gen := map[string]int{}
 	cancels := map[string]workflow.CancelFunc{}
+	// kept counts how often a step's results were kept as <step>.round-<n> before it ran
+	// again; extra holds the items a rejection adds to the inputs of the step it goes back
+	// to; holds keeps a step from running again while its earlier results are being kept.
+	kept := map[string]int{}
+	extra := map[string][]Item{}
+	holds := map[string]int{}
+	// publishNext continues a step after a person decided one of its publish requests.
+	publishNext := map[string]func(){}
+	// pod is the dev pod the devpod step of this run created; the steps in podSteps, which
+	// depend on that step, work in it. Every other step works in the pod of the run that
+	// started this one, if there is one.
+	var pod *DevPod
+	podSteps := map[string]bool{}
+	kinds := map[string]string{}
+	sessionSteps := map[string]Step{}
+	for _, s := range in.Definition.Steps {
+		kinds[s.ID] = s.Service
+		sessionSteps[s.ID] = s
+		if s.Service == DevPodService {
+			podSteps = dependents(in.Definition, s.ID)
+			delete(podSteps, s.ID)
+		}
+	}
+	podOf := func(id string) *DevPod {
+		if podSteps[id] && pod != nil {
+			return pod
+		}
+		return in.DevPod
+	}
+	podID := func(id string) string {
+		if p := podOf(id); p != nil {
+			return p.ID
+		}
+		return ""
+	}
 	selector := workflow.NewSelector(ctx)
 	var failure error
 	pending := 0
@@ -398,6 +503,9 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 			round := max(item.Round, 1)
 			if passStep[id] {
 				round = passes[id]
+			} else if kept[id] > 0 {
+				// A step that ran again after a rejection delivers the round of that run.
+				round = kept[id] + 1
 			}
 			items = append(items, Item{Source: id, Artifact: item.Artifact, Round: round})
 		}
@@ -441,11 +549,80 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 		return res, err
 	}
 
+	if err := workflow.SetQueryHandler(ctx, RoundsQuery, func() (map[string]int, error) {
+		return roundsOf(kept), nil
+	}); err != nil {
+		return res, err
+	}
+
 	ownCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		TaskQueue:           TaskQueue,
 		StartToCloseTimeout: time.Minute,
 		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 3},
 	})
+
+	// ask opens a decision for a person about the first of the publish requests an agent of
+	// the step made in the dev pod, and delivers the step's output once all are decided. A
+	// rejected request is not published; the run goes on either way.
+	var ask func(s Step, g int, p DevPod, produced []Item, requests []PublishRequest)
+	ask = func(s Step, g int, p DevPod, produced []Item, requests []PublishRequest) {
+		if len(requests) == 0 {
+			deliver(s.ID, produced)
+			return
+		}
+		r := requests[0]
+		key := fmt.Sprintf("%s.publish-%d", s.ID, r.N)
+		shown := make([]Item, 0, len(produced))
+		for _, item := range produced {
+			shown = append(shown, Item{Source: s.ID, Artifact: item.Artifact, Round: max(item.Round, kept[s.ID]+1)})
+		}
+		pending++
+		gates[key] = PendingGate{
+			Step: key, Question: PublishQuestion(r, p), Inputs: shown, Round: 1, Pass: passes[s.ID],
+			Artifact: ArtifactID(in.Prefix, fmt.Sprintf("%s.publish-%d", nameOf(s.ID), r.N)),
+			Publish: &PublishInfo{
+				Step: s.ID, Pod: p.ID, N: r.N, Kind: r.Kind, Title: r.Title, Body: r.Body,
+				Repository: p.Repository, Branch: p.WorkBranch,
+			},
+		}
+		publishNext[key] = func() { ask(s, g, p, produced, requests[1:]) }
+	}
+	// complete ends a run of a step with what it produced. A blocked step ends the run. A
+	// step whose agents worked in a dev pod first has its publish requests decided.
+	blocked := false
+	complete := func(s Step, g int, reason string, produced []Item) {
+		if reason != "" {
+			for _, item := range produced {
+				res.Artifacts[s.ID] = item.Artifact
+			}
+			if !blocked {
+				blocked, res.Blocked, res.BlockedStep = true, reason, s.ID
+			}
+			return
+		}
+		p := podOf(s.ID)
+		if p == nil || (s.Service != AgentService && s.Service != TeamService && s.Service != InteractiveService) {
+			deliver(s.ID, produced)
+			return
+		}
+		pending++
+		request := PublishRequestsRequest{Pod: p.ID, Run: in.TraceID}
+		selector.AddFuture(workflow.ExecuteActivity(ownCtx, PublishRequestsActivity, request), func(f workflow.Future) {
+			pending--
+			if gen[s.ID] != g {
+				started[s.ID] = false
+				return
+			}
+			var requests []PublishRequest
+			if err := f.Get(ctx, &requests); err != nil {
+				if failure == nil {
+					failure = fmt.Errorf("step %q failed: %w", s.ID, err)
+				}
+				return
+			}
+			ask(s, g, *p, produced, requests)
+		})
+	}
 
 	// A cancelled run ends even while it only waits for a person.
 	selector.AddReceive(ctx.Done(), func(c workflow.ReceiveChannel, _ bool) {
@@ -473,9 +650,35 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 			TraceID: in.TraceID, Workflow: in.Definition.Name, Step: gate.Step, Question: gate.Question,
 			Inputs: gate.Inputs, Decision: d.Decision, Comment: d.Comment, DecidedBy: d.DecidedBy, Artifact: gate.Artifact,
 		}
-		// A gate with on_reject sends a rejection back to its team and reopens; the record of
+		// A decision about a publish request is stored and sent to the connector service; the
+		// step that asked then goes on with its next request or delivers its output.
+		if gate.Publish != nil {
+			next := publishNext[d.Step]
+			delete(publishNext, d.Step)
+			record.Publish = gate.Publish
+			owner := gate.Publish.Step
+			g := gen[owner]
+			selector.AddFuture(workflow.ExecuteActivity(ownCtx, DecidePublishActivity, record), func(f workflow.Future) {
+				pending--
+				if gen[owner] != g {
+					started[owner] = false
+					return
+				}
+				var out StepResult
+				if err := f.Get(ctx, &out); err != nil {
+					if failure == nil {
+						failure = fmt.Errorf("step %q failed: %w", owner, err)
+					}
+					return
+				}
+				res.Artifacts[d.Step] = out.Artifact
+				next()
+			})
+			return
+		}
+		// A gate with on_reject sends a rejection back to its target and reopens; the record of
 		// that round is kept beside the gate's artifact as <artifact>.<round>.
-		sendBack := gate.OnReject != "" && d.Decision == Rejected && gate.Round < MaxRejections
+		sendBack := gate.OnReject != "" && d.Decision == Rejected && gate.Round <= gate.MaxRejections
 		if gate.OnReject != "" {
 			record.OnReject, record.Round = gate.OnReject, gate.Round
 		}
@@ -499,9 +702,100 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 			if d.Decision == Rejected {
 				if sendBack {
 					rounds[gate.Step] = gate.Round
-					rejections[gate.OnReject] = &TeamRejection{Gate: gate.Step, Round: gate.Round, DecidedBy: d.DecidedBy, Reason: d.Comment}
-					for id := range dependents(in.Definition, gate.OnReject) {
+					target := gate.OnReject
+					rejection := &TeamRejection{Gate: gate.Step, Round: gate.Round, DecidedBy: d.DecidedBy, Reason: d.Comment}
+					// A team receives the rejection as a message, and every step after it runs
+					// again. Any other target receives it as input, and only the steps between
+					// it and the gate run again.
+					var again []string
+					if kinds[target] == TeamService {
+						after := dependents(in.Definition, target)
+						for _, s := range in.Definition.Steps {
+							if after[s.ID] {
+								again = append(again, s.ID)
+							}
+						}
+						rejections[target] = rejection
+					} else {
+						again = append(between(in.Definition, target, gate.Step), gate.Step)
+						if kinds[target] == InteractiveService {
+							rejections[target] = rejection
+						}
+					}
+					// What a finished step stored is kept as <step>.round-<n> before it runs
+					// again. A team keeps its own history in its channels and files.
+					var keep []KeptStep
+					moved := map[string]KeptStep{}
+					for _, id := range again {
+						items, finished := outputs[id]
+						if !finished || kinds[id] == TeamService {
+							continue
+						}
+						step := KeptStep{Base: ArtifactID(in.Prefix, nameOf(id)), Round: kept[id] + 1}
+						for _, item := range items {
+							step.Keep = append(step.Keep, item.Artifact)
+						}
+						keep = append(keep, step)
+						moved[id] = step
+					}
+					for _, id := range again {
+						delete(extra, id)
+					}
+					if kinds[target] != TeamService {
+						// The target's next run receives, after its normal inputs: the decision
+						// record with the reason, its own previous output, and the documents
+						// the person was shown, as they were in this round.
+						items := []Item{{Source: gate.Step, Artifact: record.Artifact, Round: gate.Round, Kind: KindRejection}}
+						if step, ok := moved[target]; ok {
+							for _, item := range outputs[target] {
+								if id, ok := roundID(item.Artifact, step.Base, step.Round); ok {
+									items = append(items, Item{Source: target, Artifact: id, Round: step.Round, Kind: KindPrevious})
+								}
+							}
+						}
+						for _, item := range gate.Inputs {
+							if item.Source == target {
+								continue
+							}
+							artifact := item.Artifact
+							if step, ok := moved[item.Source]; ok {
+								if id, ok := roundID(artifact, step.Base, step.Round); ok {
+									artifact = id
+								}
+							}
+							items = append(items, Item{Source: item.Source, Artifact: artifact, Round: gate.Round, Kind: KindReviewed})
+						}
+						extra[target] = items
+					}
+					for id := range moved {
+						kept[id]++
+					}
+					if len(keep) > 0 {
+						for _, id := range again {
+							holds[id]++
+						}
+						pending++
+						request := KeepRoundsRequest{TraceID: in.TraceID, Steps: keep}
+						selector.AddFuture(workflow.ExecuteActivity(ownCtx, KeepRoundsActivity, request), func(f workflow.Future) {
+							pending--
+							for _, id := range again {
+								holds[id]--
+							}
+							if err := f.Get(ctx, nil); err != nil && failure == nil {
+								failure = fmt.Errorf("keeping the results of round %d failed: %w", gate.Round, err)
+							}
+						})
+					}
+					for _, id := range again {
 						gen[id]++
+						for key, open := range gates {
+							if open.Publish != nil && open.Publish.Step == id {
+								delete(gates, key)
+								delete(publishNext, key)
+								pending--
+								started[id] = false
+							}
+						}
 						if _, waiting := gates[id]; waiting {
 							delete(gates, id)
 							pending--
@@ -577,16 +871,21 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 			}
 			pending--
 			delete(sessions, session.Step)
-			deliver(session.Step, out.items())
+			complete(sessionSteps[session.Step], g, "", out.items())
 		})
 	})
 
 	for {
+		res.Rounds = roundsOf(kept)
 		if failure != nil {
 			return res, failure
 		}
+		// A blocked step ends the run: no later step runs, and the steps in flight are cancelled.
+		if blocked {
+			return res, nil
+		}
 		for _, s := range in.Definition.Steps {
-			if s.IsNode() || started[s.ID] || !ready(s, outputs) {
+			if s.IsNode() || started[s.ID] || holds[s.ID] > 0 || !ready(s, outputs) {
 				continue
 			}
 			started[s.ID] = true
@@ -595,7 +894,8 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 				passes[s.ID]++
 				inPass[s.ID] = true
 			}
-			stepInputs := inputs(s, in.Inputs, outputs)
+			// A step a rejection went back to also receives the rejection and what was rejected.
+			stepInputs := append(inputs(s, in.Inputs, outputs), extra[s.ID]...)
 			g := gen[s.ID]
 			run := fmt.Sprintf("%s/%d", in.Run, g)
 			// name is the step ID, or <step>.pass-<n> for a step after a merge or batch.
@@ -603,17 +903,101 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 			output := ArtifactID(in.Prefix, name)
 			switch s.Service {
 			case GateService:
-				gates[s.ID] = PendingGate{
+				gate := PendingGate{
 					Step: s.ID, Question: s.Question, Inputs: stepInputs, Artifact: output,
 					OnReject: s.OnReject, Round: rounds[s.ID] + 1, Pass: passes[s.ID],
 				}
+				if s.OnReject != "" {
+					gate.MaxRejections = s.MaxRejections
+					if gate.MaxRejections == 0 {
+						gate.MaxRejections = DefaultMaxRejections
+					}
+				}
+				gates[s.ID] = gate
+				continue
+			case DevPodService:
+				create := CreateDevPodRequest{
+					TraceID: in.TraceID, Step: s.ID, Repository: s.Repository, SourceBranch: s.SourceBranch,
+					WorkBranch: WorkBranchName(s.WorkBranch, in.TraceID), Name: s.Name, Protected: s.Protected, Rules: s.Rules,
+					Artifact: output, Metadata: ArtifactID(RunPrefix(in.TraceID), MetadataFile),
+				}
+				// The answer comes once the clone and the setup command are done.
+				timeout, _ := s.StartToClose()
+				createCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+					TaskQueue:           TaskQueue,
+					StartToCloseTimeout: timeout,
+					RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: max(s.MaxAttempts, 1)},
+				})
+				selector.AddFuture(workflow.ExecuteActivity(createCtx, CreateDevPodActivity, create), func(f workflow.Future) {
+					pending--
+					if gen[s.ID] != g {
+						started[s.ID] = false
+						return
+					}
+					var out DevPodResult
+					if err := f.Get(ctx, &out); err != nil {
+						if failure == nil {
+							failure = fmt.Errorf("step %q failed: %w", s.ID, err)
+						}
+						return
+					}
+					pod = &out.Pod
+					*held = pod
+					deliver(s.ID, []Item{{Artifact: out.Artifact}})
+				})
+				continue
+			case CommandService:
+				timeout := s.CommandTimeout()
+				command := CommandRequest{
+					TraceID: in.TraceID, Step: s.ID, Pod: podID(s.ID), Command: s.Command,
+					TimeoutSeconds: int(timeout / time.Second), AllowFailure: s.AllowFailure, Artifact: output,
+				}
+				commandCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+					TaskQueue:           TaskQueue,
+					StartToCloseTimeout: timeout + time.Minute,
+					RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: max(s.MaxAttempts, 1)},
+				})
+				selector.AddFuture(workflow.ExecuteActivity(commandCtx, RunCommandActivity, command), func(f workflow.Future) {
+					pending--
+					if gen[s.ID] != g {
+						started[s.ID] = false
+						return
+					}
+					var out StepResult
+					if err := f.Get(ctx, &out); err != nil {
+						if failure == nil {
+							failure = fmt.Errorf("step %q failed: %w", s.ID, err)
+						}
+						return
+					}
+					deliver(s.ID, out.items())
+				})
+				continue
+			case DevPodStopService:
+				stop := StopDevPodRequest{TraceID: in.TraceID, Pod: podID(s.ID), Artifact: output}
+				selector.AddFuture(workflow.ExecuteActivity(ownCtx, StopDevPodActivity, stop), func(f workflow.Future) {
+					pending--
+					if gen[s.ID] != g {
+						started[s.ID] = false
+						return
+					}
+					var out StepResult
+					if err := f.Get(ctx, &out); err != nil {
+						if failure == nil {
+							failure = fmt.Errorf("step %q failed: %w", s.ID, err)
+						}
+						return
+					}
+					deliver(s.ID, out.items())
+				})
 				continue
 			case InteractiveService:
 				session := PendingSession{
 					Step: s.ID, Agent: s.Agent, Agents: s.SessionAgents(), Inputs: stepInputs,
-					Artifact: output, Session: SessionPath(in.Prefix, name), Pass: passes[s.ID],
+					Artifact: output, Session: SessionPath(in.Prefix, name), Pass: passes[s.ID], DevPod: podID(s.ID),
 				}
-				open := OpenSessionRequest{TraceID: in.TraceID, Session: session.Session, Inputs: stepInputs}
+				open := OpenSessionRequest{TraceID: in.TraceID, Session: session.Session, Inputs: stepInputs, DevPod: session.DevPod, Rejection: rejections[s.ID]}
+				delete(rejections, s.ID)
 				selector.AddFuture(workflow.ExecuteActivity(ownCtx, OpenSessionActivity, open), func(f workflow.Future) {
 					if gen[session.Step] != g {
 						pending--
@@ -633,7 +1017,7 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 			case RouteService:
 				stepCtx, cancelStep := workflow.WithCancel(ctx)
 				cancels[s.ID] = cancelStep
-				selector.AddFuture(startRoute(stepCtx, ownCtx, in, name, stepInputs, run), func(f workflow.Future) {
+				selector.AddFuture(startRoute(stepCtx, ownCtx, in, name, stepInputs, run, podOf(s.ID)), func(f workflow.Future) {
 					pending--
 					delete(cancels, s.ID)
 					cancelStep()
@@ -651,6 +1035,10 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 					for id, artifact := range child.Artifacts {
 						res.Artifacts[s.ID+"/"+id] = artifact
 					}
+					if child.Blocked != "" {
+						complete(s, g, child.Blocked, nil)
+						return
+					}
 					// Nothing depends on a route step; the empty output marks it as finished.
 					outputs[s.ID] = []Item{}
 				})
@@ -660,7 +1048,7 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 				cancels[s.ID] = cancelStep
 				nested := startNested(stepCtx, ownCtx, nestedRun{
 					TraceID: in.TraceID, Name: s.Workflow, Inputs: stepInputs,
-					Prefix: output, Depth: in.Depth + 1, Run: run,
+					Prefix: output, Depth: in.Depth + 1, Run: run, DevPod: podOf(s.ID),
 					WorkflowID: workflow.GetInfo(ctx).WorkflowExecution.ID + "/" + name,
 				})
 				selector.AddFuture(nested, func(f workflow.Future) {
@@ -682,7 +1070,7 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 						res.Artifacts[s.ID+"/"+id] = artifact
 					}
 					// The output is every item of the nested run's final step.
-					deliver(s.ID, child.Output)
+					complete(s, g, child.Blocked, child.Output)
 				})
 				continue
 			case TeamService:
@@ -690,7 +1078,7 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 				teams[s.ID] = team
 				teamIn := TeamInput{
 					TraceID: in.TraceID, Workflow: in.Definition.Name, Step: s, Inputs: stepInputs, Prefix: in.Prefix,
-					Artifact: output, Team: team.Team, Depth: in.Depth, Run: run, Rejection: rejections[s.ID],
+					Artifact: output, Team: team.Team, Depth: in.Depth, Run: run, Rejection: rejections[s.ID], DevPod: podOf(s.ID),
 				}
 				delete(rejections, s.ID)
 				stepCtx, cancelStep := workflow.WithCancel(ctx)
@@ -718,7 +1106,7 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 						}
 						return
 					}
-					deliver(team.Step, out.items())
+					complete(s, g, out.Blocked, out.items())
 				})
 				continue
 			}
@@ -729,6 +1117,7 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 				Agent:          s.Agent,
 				Inputs:         stepInputs,
 				OutputArtifact: output,
+				DevPod:         podID(s.ID),
 			}
 			timeout, _ := s.StartToClose()
 			attempts := s.MaxAttempts
@@ -758,7 +1147,7 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 					}
 					return
 				}
-				deliver(id, out.items())
+				complete(s, g, out.Blocked, out.items())
 			})
 		}
 		// A merge or batch forwards its next message once the steps after it are idle. Those
@@ -783,6 +1172,8 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 				delete(outputs, id)
 				delete(rounds, id)
 				delete(rejections, id)
+				delete(kept, id)
+				delete(extra, id)
 			}
 			if finish(n.step.ID, items); failure != nil {
 				break
@@ -836,7 +1227,7 @@ func runPipeline(ctx workflow.Context, in Input) (Result, error) {
 // and runs it as a child workflow under the same trace. The child's steps
 // store their artifacts under "<prefix>/<name>", where name is the route step
 // or its pass. The routed workflow receives the item that named the route.
-func startRoute(ctx, ownCtx workflow.Context, in Input, name string, stepInputs []Item, run string) workflow.Future {
+func startRoute(ctx, ownCtx workflow.Context, in Input, name string, stepInputs []Item, run string, pod *DevPod) workflow.Future {
 	future, setter := workflow.NewFuture(ctx)
 	workflow.Go(ctx, func(ctx workflow.Context) {
 		var routed RouteResult
@@ -859,10 +1250,24 @@ func startRoute(ctx, ownCtx workflow.Context, in Input, name string, stepInputs 
 			Prefix:     ArtifactID(in.Prefix, name),
 			Depth:      in.Depth + 1,
 			Run:        run,
+			DevPod:     pod,
 		}).Get(ctx, &child)
 		setter.Set(child, err)
 	})
 	return future
+}
+
+// roundsOf returns how often every step that ran again after a rejection has run, or nil
+// when none did.
+func roundsOf(kept map[string]int) map[string]int {
+	if len(kept) == 0 {
+		return nil
+	}
+	rounds := make(map[string]int, len(kept))
+	for id, n := range kept {
+		rounds[id] = n + 1
+	}
+	return rounds
 }
 
 // ready reports whether every dependency of the step has finished its current run.

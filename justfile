@@ -10,7 +10,7 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
 # Central deployment list, in rollout order. Images are built from every services/*/Dockerfile.
-services := "llm-gateway openobserve telemetry-collector temporal blobstore agent-registry policy-registry tool-gateway mcp-gateway orchestrator evaluation agent factory-ui"
+services := "llm-gateway openobserve telemetry-collector temporal blobstore agent-registry policy-registry tool-gateway mcp-gateway git-host connectors orchestrator evaluation agent factory-ui"
 cluster := "opensoftwarefactory"
 context := "kind-" + cluster
 namespace := "opensoftwarefactory"
@@ -510,13 +510,14 @@ check:
     node --check scripts/migrate-unpack-inputs.js
     node --check scripts/migrate-unpack-inputs.test.js
     for script in services/factory-ui/web/*.js; do node --check "$script"; done
-    node --test scripts/auxiliary-targets.test.js scripts/lifecycle.test.js scripts/migrate-systemprompt.test.js scripts/migrate-unpack-inputs.test.js scripts/openobserve.test.js scripts/log-collector.test.js services/factory-ui/agents_ui_test.mjs services/factory-ui/chat_ui_test.mjs services/factory-ui/evaluations_ui_test.mjs services/factory-ui/dom_ui_test.mjs services/factory-ui/markdown_ui_test.mjs services/factory-ui/mcp_gateway_ui_test.mjs services/factory-ui/policy_templates_ui_test.mjs services/factory-ui/registry_name_ui_test.mjs services/factory-ui/run_index_ui_test.mjs services/factory-ui/rerun_ui_test.mjs services/factory-ui/runs_timeline_ui_test.mjs services/factory-ui/teams_editor_test.mjs services/factory-ui/teams_ui_test.mjs services/factory-ui/inputs_ui_test.mjs services/factory-ui/workflows_page_test.mjs services/factory-ui/merge_batch_ui_test.mjs
+    node --test scripts/auxiliary-targets.test.js scripts/lifecycle.test.js scripts/migrate-systemprompt.test.js scripts/migrate-unpack-inputs.test.js scripts/openobserve.test.js scripts/log-collector.test.js services/factory-ui/agents_ui_test.mjs services/factory-ui/chat_ui_test.mjs services/factory-ui/evaluations_ui_test.mjs services/factory-ui/dom_ui_test.mjs services/factory-ui/markdown_ui_test.mjs services/factory-ui/mcp_gateway_ui_test.mjs services/factory-ui/policy_templates_ui_test.mjs services/factory-ui/registry_name_ui_test.mjs services/factory-ui/run_index_ui_test.mjs services/factory-ui/rerun_ui_test.mjs services/factory-ui/runs_timeline_ui_test.mjs services/factory-ui/teams_editor_test.mjs services/factory-ui/teams_ui_test.mjs services/factory-ui/inputs_ui_test.mjs services/factory-ui/workflows_page_test.mjs services/factory-ui/merge_batch_ui_test.mjs services/factory-ui/devpods_ui_test.mjs services/factory-ui/connectors_ui_test.mjs
     kubectl kustomize infra/kubernetes/overlays/local >/dev/null
-    for module in llm-gateway blobstore mcp-gateway orchestrator registry evaluation agent factory-ui; do
+    for module in llm-gateway blobstore mcp-gateway connectors orchestrator registry evaluation agent factory-ui; do
         test -z "$(gofmt -l "services/$module")"
         go -C "services/$module" vet ./...
         go -C "services/$module" test -race ./...
     done
     uv run --project services/tool-gateway --locked pytest -q services/tool-gateway
+    uv run --no-project python3 -m unittest discover -b -s services/devpod/tests
     printf "\033[0;32m✓ All checks passed\033[0m\n"
     echo ""

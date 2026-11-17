@@ -155,6 +155,30 @@
     </div>
   </section>
 
+  <!-- Connectors: the connector kinds, and the Git repositories with the live dev pods -->
+  <section class="page page-cluster page-connectors" id="tab-connectors" hidden>
+    <div class="panel list-panel">
+      <div class="panel-head"><h2>Connectors</h2></div>
+      <div class="panel-body"><ul id="connector-kinds" class="rows" role="listbox" aria-label="Connector kinds"></ul></div>
+    </div>
+    <div class="panel content-panel">
+      <div class="panel-head"><h2>Git</h2><span id="connector-new-slot"></span></div>
+      <div class="panel-body" id="connector-main"></div>
+    </div>
+  </section>
+
+  <!-- Dev pod (opened from Connectors and Runs): its files, commit log and diff, read-only -->
+  <section class="page page-cluster page-devpods" id="tab-devpods" hidden>
+    <div class="panel list-panel">
+      <div class="panel-head"><h2>Dev pod</h2></div>
+      <div class="panel-body"><ul id="devpod-tree"></ul></div>
+    </div>
+    <div class="panel content-panel">
+      <div class="panel-head"></div>
+      <div class="panel-body" id="devpod-detail"></div>
+    </div>
+  </section>
+
   <section class="page page-cluster" id="tab-cluster" hidden>
     <div class="panel list-panel">
       <div class="panel-head"><h2>Cluster</h2></div>
@@ -174,6 +198,7 @@
 <script src="workflowref.js"></script>
 <script src="teams.js"></script>
 <script src="inputs.js"></script>
+<script src="connectors.js"></script>
 <script src="workflows.js"></script>
 <script src="runs.js"></script>
 <script src="evaluations.js"></script>

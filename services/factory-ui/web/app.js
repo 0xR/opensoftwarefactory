@@ -21,10 +21,11 @@ const PAGES = [
   { name: "mcp-gateway", title: "MCP Gateway", icon: "gateway", tip: "MCP passthrough services" },
   { name: "artifacts", title: "Memory", icon: "memory", tip: "The blobstore: runs, tasks, templates, artifacts" },
   { name: "evaluations", title: "Evaluations", icon: "evaluation", tip: "Saved sets of comparable runs" },
+  { name: "connectors", title: "Connectors", icon: "connector", tip: "Git repositories and dev pods" },
   { name: "cluster", title: "Cluster", icon: "cluster", tip: "Pods, logs, and services" },
 ];
 // Pages without a menu item: opened from another page, whose menu item stays the active one.
-const SUBPAGES = { teams: { name: "teams", title: "Team", menu: "runs" } };
+const SUBPAGES = { teams: { name: "teams", title: "Team", menu: "runs" }, devpods: { name: "devpods", title: "Dev pod", menu: "connectors" } };
 
 // Icons: 16px, 1.5px stroke, currentColor. Static markup only.
 const ICONS = {
@@ -36,6 +37,8 @@ const ICONS = {
   policy: '<path d="M8 2l5 2v4c0 3-2.2 5-5 6-2.8-1-5-3-5-6V4z"/>',
   gateway: '<path d="M2 4h4M10 4h4M6 2v4M10 2v4M4 12h8M8 6v6"/>',
   memory: '<ellipse cx="8" cy="4" rx="5" ry="2"/><path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>',
+  connector: '<path d="M6 2v3M10 2v3M4.5 5h7v3a3.5 3.5 0 0 1-7 0zM8 11.5V14"/>',
+  download: '<path d="M8 3v8M5 8l3 3 3-3M3 13h10"/>',
   cluster: '<rect x="2" y="2" width="12" height="5" rx="1"/><rect x="2" y="9" width="12" height="5" rx="1"/><path d="M5 4.5h.01M5 11.5h.01"/>',
   plus: '<path d="M8 3v10M3 8h10"/>',
   more: '<path d="M3.5 8h.01M8 8h.01M12.5 8h.01" stroke-width="2.5" stroke-linecap="round"/>',
@@ -107,7 +110,9 @@ document.addEventListener("keydown", (ev) => {
 });
 
 // The state vocabulary: a filled dot plus a word, with fixed colors.
-const STATE_WORDS = { running: "Running", done: "Completed", failed: "Failed", waiting: "Waiting", idle: "Idle" };
+// blocked is a run an agent ended with report_blocked: a person has to clear the way, so its
+// chip is in the waiting colour family, never the failed one.
+const STATE_WORDS = { running: "Running", done: "Completed", failed: "Failed", waiting: "Waiting", blocked: "Blocked", idle: "Idle" };
 
 function statusChip(state, word = STATE_WORDS[state], title = "") {
   // A chip has a tooltip only when it adds a reason; the word is already visible.
@@ -119,6 +124,7 @@ function runState(status, waiting = false) {
   if (!status) return "idle";
   if (status === "Running") return waiting ? "waiting" : "running";
   if (status === "Completed") return "done";
+  if (status === "Blocked") return "blocked";
   return "failed";
 }
 
@@ -166,6 +172,22 @@ async function loadBlob(id) {
     trace: res.headers.get("X-Trace-Id") || "",
     created: res.headers.get("X-Created") || "",
   };
+}
+
+// downloadBlob saves a blobstore object as a file with the given name. The bytes are handed to
+// the browser as a download of no particular type, so an HTML file is stored, never rendered
+// inside the factory.
+async function downloadBlob(id, name) {
+  try {
+    const res = await fetch(`/api/blobs/blobs/${id}`);
+    if (!res.ok) throw new Error(errorMessage(await res.text(), res));
+    const url = URL.createObjectURL(new Blob([await res.arrayBuffer()], { type: "application/octet-stream" }));
+    const link = h("a", { href: url, download: name, hidden: true });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (e) { setStatus(`Cannot download ${name}: ${e.message}`, "error"); }
 }
 
 // pretty indents text that parses as JSON and returns any other text unchanged.
@@ -795,17 +817,47 @@ const traceListings = traceQueue((trace) => api("GET", `/api/blobs/trace/${encod
 
 // A step after a merge or batch node runs once for every message the node forwards. Pass n of
 // such a step stores its output as <step>.pass-<n>, with its records beside it
-// (<step>.pass-<n>.run.json, <step>.pass-<n>.attempt-<k>.run.json). stepPass splits such a name,
-// also a path through workflow nodes, into the step and its pass; the pass is 0 without one.
+// (<step>.pass-<n>.run.json, <step>.pass-<n>.attempt-<k>.run.json). A step that runs again after
+// a rejection keeps what round n stored as <step>.round-<n> (with <step>.round-<n>.run.json and
+// the objects of a nested run under it); the newest result keeps the plain name. stepPass
+// splits such a name, also a path through workflow nodes, into the step, its pass and its
+// round; pass and round are 0 without one. Neither a pass nor a round is a step of its own.
 const PASS_PART = /^(.+)\.pass-([1-9][0-9]*)$/;
+const ROUND_PART = /^(.+)\.round-([1-9][0-9]*)$/;
 function stepPass(name) {
-  let pass = 0;
+  let pass = 0, round = 0;
   const step = String(name).split("/").map((part) => {
+    const kept = ROUND_PART.exec(part);
+    if (kept) { round = Number(kept[2]); part = kept[1]; } // the round follows the pass: build.pass-2.round-1
     const found = PASS_PART.exec(part);
     if (found) pass = Number(found[2]); // the innermost pass is the step's own
     return found ? found[1] : part;
   }).join("/");
-  return { step, pass };
+  return { step, pass, round };
+}
+
+// A publish decision (an agent's push or pull request that a person approves) waits and is
+// recorded as <step>.publish-<n>. publishStep names the step that asked, "" for any other name;
+// such a record is never a step of its own.
+const PUBLISH_PART = /^(.+)\.publish-([1-9][0-9]*)$/;
+const publishStep = (name) => PUBLISH_PART.exec(String(name))?.[1] || "";
+
+// runExtras is the one place that reads what the run status says about dev pods and rounds.
+// The answer of GET /api/orchestrator/runs/<trace> has, when they exist:
+//   "dev_pod": { "id", "repository", "source_branch", "work_branch" }   the run's dev pod
+//   "pull_request": "<object ID of pull-request.json>"                  the stored pull request record
+//   "rounds": { "<step>": <how often the step ran> }                    steps that ran again after a rejection
+// and the status value "Blocked" with the agent's reason in "error".
+function runExtras(st) {
+  const pod = st?.dev_pod && typeof st.dev_pod === "object" && st.dev_pod.id ? st.dev_pod : null;
+  const roundCounts = {};
+  for (const [step, n] of Object.entries(st?.rounds && typeof st.rounds === "object" ? st.rounds : {})) if (Number(n) > 1) roundCounts[step] = Math.floor(Number(n));
+  return {
+    devPod: pod ? { id: String(pod.id), repository: String(pod.repository || ""), sourceBranch: String(pod.source_branch || ""), workBranch: String(pod.work_branch || "") } : null,
+    pullRequest: typeof st?.pull_request === "string" ? st.pull_request : "",
+    roundCounts,
+    blocked: st?.status === "Blocked" ? String(st.error || "") : "",
+  };
 }
 
 // stepTitle names a step for a person: its own name in title case and, when it runs in passes,
@@ -813,7 +865,7 @@ function stepPass(name) {
 function stepTitle(name, pass = 0) {
   const at = stepPass(name);
   const n = Number(pass) || at.pass;
-  return `${titleCase(at.step.split("/").pop())}${n ? ` · pass ${n}` : ""}`;
+  return `${titleCase(at.step.split("/").pop())}${n ? ` · pass ${n}` : ""}${at.round ? ` · round ${at.round}` : ""}`;
 }
 
 // runIndex knows every run from runs/<trace>/run.json (cached, it never changes) and
@@ -884,7 +936,9 @@ const runIndex = {
   // show them too: artifacts maps step to object, order lists the steps by finish time,
   // agents maps an agent step to the agent it ran (from <step>.run.json). passes maps a step
   // after a merge or batch node to its passes, [{ pass, artifact, record }], oldest first;
-  // artifacts then names the output of its newest pass.
+  // artifacts then names the output of its newest pass. rounds maps a step that ran again after
+  // a rejection to its kept rounds, [{ round, artifact, record }], oldest first; the newest
+  // result is the step's own.
   // page names the page that shows the run's steps. Listing them is slow (see traceQueue), so a
   // caller that needs the status alone (a table row, a badge) passes "" and never waits for it;
   // a finished run is listed once, a running one again when its listing is older than maxAgeMs.
@@ -898,7 +952,7 @@ const runIndex = {
     if (!current) {
       try {
         const st = await api("GET", `/api/orchestrator/runs/${trace}`);
-        entry = { status: st.status, workflow: st.workflow || "", started: st.started && !st.started.startsWith("0001") ? st.started : "", artifacts: st.artifacts || {}, nodes: st.nodes && typeof st.nodes === "object" ? st.nodes : {}, error: st.error || "", at: Date.now() }; // nodes: what the merge and batch steps hold
+        entry = { status: st.status, workflow: st.workflow || "", started: st.started && !st.started.startsWith("0001") ? st.started : "", artifacts: st.artifacts || {}, nodes: st.nodes && typeof st.nodes === "object" ? st.nodes : {}, error: st.error || "", ...runExtras(st), at: Date.now() }; // nodes: what the merge and batch steps hold
       } catch (e) {
         entry = { status: "", artifacts: {}, error: e.message, gone: /not found/i.test(e.message), at: Date.now() };
         if (!entry.gone) return entry;
@@ -913,6 +967,7 @@ const runIndex = {
       entry.records = out.records;
       entry.attemptRecords = out.attemptRecords;
       entry.passes = out.passes;
+      entry.rounds = out.rounds; // the kept rounds of the steps that ran again after a rejection
       entry.metadata = out.metadata; // whether runs/<trace>/metadata.json exists
       if (!out.failed) entry.listedAt = Date.now(); // a listing that failed or was dropped is asked again
     }
@@ -922,8 +977,19 @@ const runIndex = {
 
   async outputs(trace, listing) {
     const prefix = `runs/${trace}/`;
-    const artifacts = {}, created = {}, nested = new Set(), records = new Set(), attemptRecords = new Map(), nestedArtifacts = {}, passes = {};
+    const artifacts = {}, created = {}, nested = new Set(), records = new Set(), attemptRecords = new Map(), nestedArtifacts = {}, passes = {}, rounds = {};
     let failed = false, metadata = false;
+    // roundOf finds the entry of one kept round of a step ("build.round-1", also of a pass or
+    // of a nested step), adding it when it is new; null for a name without a round.
+    const roundOf = (key) => {
+      const at = stepPass(key);
+      if (!at.round) return null;
+      const step = key.split("/").map((part) => part.replace(ROUND_PART, "$1")).join("/"); // the step, with its pass
+      const list = (rounds[step] ||= []);
+      let entry = list.find((r) => r.round === at.round);
+      if (!entry) list.push(entry = { round: at.round, artifact: "", record: "" });
+      return entry;
+    };
     // passOf finds the entry of one pass of a step, adding it when it is new. A record is
     // named by its key, the step with its pass ("compare.pass-2"), as in records.
     const passOf = (key) => {
@@ -934,7 +1000,13 @@ const runIndex = {
       if (!entry) list.push(entry = { pass, artifact: "", record: "" });
       return entry;
     };
-    const record = (key) => { records.add(key); const entry = passOf(key); if (entry) entry.record = key; };
+    const record = (key) => {
+      records.add(key);
+      const kept = roundOf(key);
+      if (kept) { kept.record = key; return; } // the record of a kept round, never of the newest pass
+      const entry = passOf(key);
+      if (entry) entry.record = key;
+    };
     try {
       const t = await traceListings.ask(trace, listing);
       for (const o of t.objects || []) {
@@ -943,6 +1015,8 @@ const runIndex = {
         const step = rest.split("/")[0];
         if (step === "metadata.json") { metadata = true; continue; } // the run metadata, not a step
         if (!step || step === "input" || step === "run.json" || step === "_evidence") continue;
+        if (step === "pull-request.json" || step === "pull-request.patch") continue; // the pull request record of the run, not a step
+        if (rest.split("/").some(publishStep)) continue; // the record of a publish decision, not a step
         // Execution records can belong to a routed child workflow and therefore contain
         // slashes. Classify them before treating nested objects as ordinary route output.
         const attemptRecord = /^(.*)\.attempt-[1-9][0-9]*\.run\.json$/.exec(rest);
@@ -954,6 +1028,13 @@ const runIndex = {
           continue;
         }
         if (rest.endsWith(".run.json")) { record(rest.slice(0, -".run.json".length)); continue; }
+        // What an earlier round left belongs to its step and round: "build.round-1" is round 1 of
+        // build, and "flow.round-1/inner" an object of the nested run of round 1; neither is a step.
+        if (stepPass(rest).round) {
+          const kept = rest.includes("/") && !stepPass(rest.split("/").pop()).round ? null : roundOf(rest);
+          if (kept) kept.artifact = o.id;
+          continue;
+        }
         // The output of a pass belongs to its step: "compare.pass-2" is pass 2 of compare, not a step.
         const pass = passOf(rest);
         if (pass) pass.artifact = o.id;
@@ -971,7 +1052,8 @@ const runIndex = {
     } catch { failed = true; /* the status still shows */ }
     const order = Object.keys(created).sort((a, b) => String(created[a]).localeCompare(String(created[b])));
     for (const ids of attemptRecords.values()) ids.sort((a, b) => Number(/\.attempt-([0-9]+)\.run\.json$/.exec(a)?.[1] || 0) - Number(/\.attempt-([0-9]+)\.run\.json$/.exec(b)?.[1] || 0));
-    return { artifacts, order, nested, records, attemptRecords, nestedArtifacts, passes, failed, metadata };
+    for (const list of Object.values(rounds)) list.sort((a, b) => a.round - b.round);
+    return { artifacts, order, nested, records, attemptRecords, nestedArtifacts, passes, rounds, failed, metadata };
   },
 
   // name is what sidebars and tables call a run: its workflow; a run without one is named
@@ -1071,6 +1153,8 @@ const PANELS = {
     { column: ".content-panel", prop: "--col-detail", min: 320, max: 720, edge: "left" },
   ],
   cluster: [{ column: ".list-panel", prop: "--col-list", min: 200, max: 480 }],
+  connectors: [{ column: ".list-panel", prop: "--col-list", min: 200, max: 480 }],
+  devpods: [{ column: ".list-panel", prop: "--col-list", min: 200, max: 480 }],
 };
 const MIN_MAIN = 280;
 const widthKey = (tab, prop) => `factory.width.${tab}.${prop}`;

@@ -78,5 +78,40 @@ class PolicyRegistry:
         return response.json()
 
 
+class Connectors:
+    """The connector service, which checks and runs every tool call on a dev pod."""
+
+    # A command in a dev pod may run for ten minutes; the call must outlast it.
+    TOOL_TIMEOUT = 660.0
+
+    def __init__(self, base_url: str, transport: httpx.BaseTransport | None = None) -> None:
+        self.client = httpx.Client(base_url=base_url, timeout=self.TOOL_TIMEOUT, transport=transport)
+
+    def tool(self, pod: str, tool: str, args: dict[str, Any], agent: str, run: str) -> Any:
+        """Run one dev pod tool and return its result.
+
+        A call the connector service refuses raises ValueError with the message
+        written for the agent: what was refused, why, and what to do instead.
+        """
+        if not SEGMENT.match(pod or ""):
+            raise ValueError(
+                "this run has no dev pod, so the dev pod tools cannot be used: "
+                "the workflow needs a devpod step before this step"
+            )
+        try:
+            response = self.client.post(
+                f"/api/devpods/{quote(pod)}/tool", json={"tool": tool, "args": args, "agent": agent, "run": run}
+            )
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"the connector service did not answer {tool}: {type(exc).__name__}") from exc
+        if response.is_error:
+            raise RuntimeError(f"connector service: HTTP {response.status_code}: {response.text.strip()}")
+        answer = response.json()
+        if not answer.get("ok"):
+            raise ValueError(answer.get("error") or f"{tool} was refused without a reason")
+        return answer.get("result")
+
+
 blobstore = Blobstore(os.environ.get("BLOBSTORE_URL", "http://blobstore:8080"))
 policies = PolicyRegistry(os.environ.get("POLICY_REGISTRY_URL", "http://policy-registry:8080"))
+connectors = Connectors(os.environ.get("CONNECTORS_URL", "http://connectors:8080"))
