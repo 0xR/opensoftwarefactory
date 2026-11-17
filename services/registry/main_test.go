@@ -310,7 +310,7 @@ func TestSeedAgentsCarryUnpackInputs(t *testing.T) {
 		}
 		return validateModelSettings(data)
 	})
-	if err != nil || count != 18 {
+	if err != nil || count != 21 {
 		t.Fatalf("seed agents: %d checked, %v", count, err)
 	}
 }
@@ -319,7 +319,7 @@ func TestSeedAgentsCarryUnpackInputs(t *testing.T) {
 // every policy its prompt includes is a seed policy.
 func TestSeedAgentsAreTheCourseAgents(t *testing.T) {
 	folders, err := filepath.Glob("seed/agents/*/*/v1")
-	if err != nil || len(folders) != 18 {
+	if err != nil || len(folders) != 21 {
 		t.Fatalf("seed agent folders: %d, %v", len(folders), err)
 	}
 	policies := map[string]bool{}

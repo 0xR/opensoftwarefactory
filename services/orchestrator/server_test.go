@@ -376,7 +376,7 @@ func TestConfigTemplateIsValid(t *testing.T) {
 	want := map[string]int{
 		"ex01-team-standing": 2, "ex02-research-workflow": 6, "ex03-system-design": 3,
 		"ex04-intake-triage": 3, "ex05-architecture-review": 2, "ex06-implementation": 6,
-		"ex07-guardrails": 7, "ex08-pr-review": 7, "ex09-trust-runs": 3,
+		"ex07-guardrails": 7, "ex08-pr-review": 8, "ex09-trust-runs": 3,
 	}
 	if len(c.Workflows) != len(want) {
 		t.Fatalf("template has %d workflows, want %d", len(c.Workflows), len(want))
@@ -433,8 +433,8 @@ func TestConfigTemplateStepsNameSeedAgents(t *testing.T) {
 			}
 		}
 	}
-	if agents != 19 {
-		t.Errorf("the template names %d agents, want 19", agents)
+	if agents != 22 {
+		t.Errorf("the template names %d agents, want 22", agents)
 	}
 }
 
@@ -461,24 +461,27 @@ func TestConfigTemplateSeedsTheParallelExercises(t *testing.T) {
 	if s := research.Steps[5]; s.Service != pipeline.GateService || s.Question != "Is the research report good enough to use? A rejection needs a reason." {
 		t.Errorf("gate step %+v", s)
 	}
-	// The two review agents and the test command work side by side in the dev pod.
-	if s := review.Steps[0]; s.Service != pipeline.DevPodService || s.Repository != "claims-review" || len(s.DependsOn) != 0 {
-		t.Errorf("pod step %+v", s)
+	// The five review agents work side by side on the pull request in the input.
+	reviewers := []string{"spec", "test", "code", "security", "qa"}
+	var ids []string
+	for i, name := range reviewers {
+		s := review.Steps[i]
+		if s.ID != name+"-review" || s.Agent != "course/"+name+"-agent@v1" || len(s.DependsOn) != 0 {
+			t.Errorf("review step %+v", s)
+		}
+		ids = append(ids, s.ID)
 	}
-	if a, b := review.Steps[1], review.Steps[2]; strings.Join(a.DependsOn, ",") != "pod" || strings.Join(b.DependsOn, ",") != "pod" || a.Agent != "course/spec-agent@v1" || b.Agent != "course/qa-agent@v1" {
-		t.Errorf("review steps %+v %+v", a, b)
-	}
-	if s := review.Steps[3]; s.Service != pipeline.CommandService || strings.Join(s.DependsOn, ",") != "pod" || !s.AllowFailure {
-		t.Errorf("tests step %+v", s)
-	}
-	if s := review.Steps[4]; s.Service != pipeline.MergeService || strings.Join(s.DependsOn, ",") != "spec-review,qa-review,tests" || s.InputTimeout != 1800 {
+	if s := review.Steps[5]; s.Service != pipeline.MergeService || strings.Join(s.DependsOn, ",") != strings.Join(ids, ",") || s.InputTimeout != 1800 {
 		t.Errorf("merge step %+v", s)
+	}
+	if s := review.Steps[6]; s.Agent != "course/dossier-writer@v1" || strings.Join(s.DependsOn, ",") != "collect" {
+		t.Errorf("dossier step %+v", s)
 	}
 	// A rejection at either gate goes back to the step that wrote what was reviewed.
 	if s := research.Steps[5]; s.OnReject != "report" {
 		t.Errorf("research gate %+v", s)
 	}
-	if s := review.Steps[6]; s.Service != pipeline.GateService || s.OnReject != "dossier" {
+	if s := review.Steps[7]; s.Service != pipeline.GateService || s.OnReject != "dossier" {
 		t.Errorf("review gate %+v", s)
 	}
 }

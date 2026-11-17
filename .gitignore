@@ -36,3 +36,6 @@ plans/
 plan.md
 *.plan.md
 PLAN.md
+
+# The landing page draft stays local.
+/landing.html

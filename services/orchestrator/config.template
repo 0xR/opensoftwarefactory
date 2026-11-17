@@ -338,54 +338,55 @@ workflows:
           x: 260
           y: 846
   - name: ex08-pr-review
-    description: "Session 8 exercise: a spec agent and a QA agent check the author agent's commit in a dev pod, and a dossier goes to the person who decides."
+    description: "Session 8 exercise: five specialized review agents check a pull request, and a dossier goes to the person who decides."
     steps:
-      - id: pod
-        service: devpod
-        repository: claims-review
-        source_branch: main
-        work_branch: review/{run}
-        position:
-          x: 268
-          y: 30
       - id: spec-review
         service: agent
         agent: course/spec-agent@v1
-        timeout: 15m
-        depends_on:
-          - pod
+        timeout: 10m
         position:
           x: 0
-          y: 166
+          y: 30
+      - id: test-review
+        service: agent
+        agent: course/test-agent@v1
+        timeout: 10m
+        position:
+          x: 268
+          y: 30
+      - id: code-review
+        service: agent
+        agent: course/code-agent@v1
+        timeout: 10m
+        position:
+          x: 536
+          y: 30
+      - id: security-review
+        service: agent
+        agent: course/security-agent@v1
+        timeout: 10m
+        position:
+          x: 804
+          y: 30
       - id: qa-review
         service: agent
         agent: course/qa-agent@v1
-        timeout: 15m
-        depends_on:
-          - pod
+        timeout: 10m
         position:
-          x: 268
-          y: 166
-      - id: tests
-        service: command
-        command: ./test.sh
-        allow_failure: true
-        timeout: 2m
-        depends_on:
-          - pod
-        position:
-          x: 536
-          y: 166
+          x: 1072
+          y: 30
       - id: collect
         service: merge
         input_timeout: 1800
         depends_on:
           - spec-review
+          - test-review
+          - code-review
+          - security-review
           - qa-review
-          - tests
         position:
-          x: 268
-          y: 302
+          x: 536
+          y: 166
       - id: dossier
         service: agent
         agent: course/dossier-writer@v1
@@ -393,8 +394,8 @@ workflows:
         depends_on:
           - collect
         position:
-          x: 268
-          y: 438
+          x: 536
+          y: 302
       - id: decide
         service: gate
         question: What do you decide about this pull request? A rejection needs a reason and goes back to the dossier writer.
@@ -402,8 +403,8 @@ workflows:
         depends_on:
           - dossier
         position:
-          x: 268
-          y: 574
+          x: 536
+          y: 438
   - name: ex09-trust-runs
     description: "Session 9 exercise, Would You Trust These Agent Runs: label agent runs from their records and propose one check for a failure found."
     steps:
